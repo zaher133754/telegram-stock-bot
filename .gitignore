@@ -1,0 +1,10 @@
+.env
+chat_id.txt
+bot.log
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.idea/
+.vscode/
