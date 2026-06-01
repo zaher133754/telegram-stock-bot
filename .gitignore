@@ -1,10 +1,13 @@
 .env
 chat_id.txt
+user_settings.json
 bot.log
 __pycache__/
 *.py[cod]
 .venv/
 venv/
 env/
+.tmp/
+.pip-cache/
 .idea/
 .vscode/
