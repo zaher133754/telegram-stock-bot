@@ -218,7 +218,7 @@ class MoexClient:
         interval: int,
         days_back: int,
     ) -> list[dict[str, Any]]:
-        from_date = date.today() - timedelta(days=days_back)
+        from_date = datetime.now(self.timezone).date() - timedelta(days=days_back)
         rows: list[dict[str, Any]] = []
         start = 0
 
@@ -265,7 +265,7 @@ class MoexClient:
 
     def _closed_candles(self, candles: Iterable[Candle]) -> list[Candle]:
         now = datetime.now(self.timezone)
-        closed = [candle for candle in candles if candle.end <= now]
+        closed = [candle for candle in candles if candle.end < now]
         closed.sort(key=lambda candle: (candle.end, candle.begin))
         return closed
 

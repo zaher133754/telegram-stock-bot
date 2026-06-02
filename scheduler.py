@@ -2,96 +2,38 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass
+from collections import defaultdict
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 from telegram.ext import Application
 
-from analytics import (
-    build_daily_report,
-    build_monthly_report,
-    build_weekly_report,
-    collect_moex_analysis,
-)
+from analytics import build_auto_notification_report, collect_moex_analysis
 from config import Settings
 from keyboards import report_actions_keyboard
-from user_settings import ReportType, UserSettings, UserSettingsStore
+from user_settings import (
+    UserSettings,
+    UserSettingsStore,
+    calculate_next_streaks,
+)
 from utils import split_telegram_message
 
 
 logger = logging.getLogger(__name__)
-
-WEEKDAY_CRON = {
-    "MONDAY": "mon",
-    "TUESDAY": "tue",
-    "WEDNESDAY": "wed",
-    "THURSDAY": "thu",
-    "FRIDAY": "fri",
-    "SATURDAY": "sat",
-    "SUNDAY": "sun",
-}
-
-
-@dataclass(frozen=True)
-class AutoReportSpec:
-    report_type: ReportType
-    timeframe: str
-    title: str
-
-
-AUTO_REPORTS = {
-    "daily": AutoReportSpec("daily", "1d", "daily"),
-    "weekly": AutoReportSpec("weekly", "1w", "weekly"),
-    "monthly": AutoReportSpec("monthly", "1mo", "monthly"),
-}
 
 
 def start_scheduler(application: Application) -> AsyncIOScheduler:
     settings: Settings = application.bot_data["settings"]
     scheduler = AsyncIOScheduler(timezone=settings.timezone)
 
-    daily_hour, daily_minute = split_report_time(settings.daily_report_time)
     scheduler.add_job(
-        run_auto_report,
-        trigger=CronTrigger(
-            hour=daily_hour,
-            minute=daily_minute,
+        run_auto_notifications,
+        trigger=IntervalTrigger(
+            seconds=settings.scheduler_interval_seconds,
             timezone=settings.timezone,
         ),
-        args=[application, AUTO_REPORTS["daily"]],
-        id="daily_report",
-        max_instances=1,
-        coalesce=True,
-        replace_existing=True,
-    )
-
-    weekly_hour, weekly_minute = split_report_time(settings.weekly_report_time)
-    scheduler.add_job(
-        run_auto_report,
-        trigger=CronTrigger(
-            day_of_week=WEEKDAY_CRON[settings.weekly_report_day],
-            hour=weekly_hour,
-            minute=weekly_minute,
-            timezone=settings.timezone,
-        ),
-        args=[application, AUTO_REPORTS["weekly"]],
-        id="weekly_report",
-        max_instances=1,
-        coalesce=True,
-        replace_existing=True,
-    )
-
-    monthly_hour, monthly_minute = split_report_time(settings.monthly_report_time)
-    scheduler.add_job(
-        run_auto_report,
-        trigger=CronTrigger(
-            hour=monthly_hour,
-            minute=monthly_minute,
-            timezone=settings.timezone,
-        ),
-        args=[application, AUTO_REPORTS["monthly"]],
-        id="monthly_report",
+        args=[application],
+        id="auto_notifications",
         max_instances=1,
         coalesce=True,
         replace_existing=True,
@@ -99,11 +41,8 @@ def start_scheduler(application: Application) -> AsyncIOScheduler:
 
     scheduler.start()
     logger.info(
-        "Auto report scheduler started: daily=%s, weekly=%s %s, monthly=%s",
-        settings.daily_report_time,
-        settings.weekly_report_day,
-        settings.weekly_report_time,
-        settings.monthly_report_time,
+        "Auto notification scheduler started: interval=%s seconds",
+        settings.scheduler_interval_seconds,
     )
     return scheduler
 
@@ -114,41 +53,96 @@ def stop_scheduler(application: Application) -> None:
         scheduler.shutdown(wait=False)
 
 
-async def run_auto_report(application: Application, spec: AutoReportSpec) -> None:
+async def run_auto_notifications(application: Application) -> None:
     settings: Settings = application.bot_data["settings"]
     store: UserSettingsStore = application.bot_data["user_settings_store"]
 
-    users = [user for user in store.list_users() if is_report_enabled(user, spec.report_type)]
+    users = [user for user in store.list_users() if user.auto_notifications_enabled]
     if not users:
-        logger.info("No users enabled for %s auto report", spec.report_type)
+        logger.info("No users enabled for auto notifications")
         return
 
-    try:
-        result = await asyncio.to_thread(collect_moex_analysis, settings, spec.timeframe)
-    except FileNotFoundError:
-        logger.exception("Tickers file was not found")
-        return
-    except Exception:
-        logger.exception("Failed to build %s auto report", spec.report_type)
-        return
+    users_by_timeframe: dict[str, list[UserSettings]] = defaultdict(list)
+    for user in users:
+        for timeframe in user.notification_timeframes:
+            users_by_timeframe[timeframe].append(user)
 
-    if result.latest_candle_time is None:
-        logger.info("No closed candle data for %s auto report", spec.report_type)
-        return
+    for timeframe, timeframe_users in users_by_timeframe.items():
+        try:
+            result = await asyncio.to_thread(collect_moex_analysis, settings, timeframe)
+        except FileNotFoundError:
+            logger.exception("Tickers file was not found")
+            continue
+        except Exception:
+            logger.exception("Failed to build auto notification for %s", timeframe)
+            continue
 
-    text = build_auto_report_text(spec.report_type, result)
+        if result.latest_candle_time is None:
+            logger.info("No closed candle data for auto notification %s", timeframe)
+            continue
+
+        await process_timeframe_notifications(
+            application=application,
+            store=store,
+            settings=settings,
+            timeframe=timeframe,
+            users=timeframe_users,
+            result=result,
+        )
+
+
+async def process_timeframe_notifications(
+    *,
+    application: Application,
+    store: UserSettingsStore,
+    settings: Settings,
+    timeframe: str,
+    users: list[UserSettings],
+    result,
+) -> None:
+    matched_tickers = [item.ticker for item in result.matched_items]
+
     for user in users:
         current_user = store.get_user(user.user_id)
-        if current_user is None or not is_report_enabled(current_user, spec.report_type):
+        if current_user is None:
             continue
-        if get_last_sent_candle(current_user, spec.report_type) == result.latest_candle_time:
+        if not current_user.auto_notifications_enabled:
+            continue
+        if timeframe not in current_user.notification_timeframes:
+            continue
+        if current_user.last_sent_candle_times.get(timeframe) == result.latest_candle_time:
             logger.info(
-                "%s auto report already sent to user_id=%s for candle=%s",
-                spec.report_type,
+                "Auto notification already processed for user_id=%s timeframe=%s candle=%s",
                 current_user.user_id,
+                timeframe,
                 result.latest_candle_time,
             )
             continue
+
+        if not matched_tickers:
+            store.record_auto_result(
+                user_id=current_user.user_id,
+                timeframe=timeframe,
+                candle_time=result.latest_candle_time,
+                matched_tickers=[],
+            )
+            logger.info(
+                "No matching tickers for user_id=%s timeframe=%s candle=%s",
+                current_user.user_id,
+                timeframe,
+                result.latest_candle_time,
+            )
+            continue
+
+        next_streaks = calculate_next_streaks(
+            current_user.streaks.get(timeframe, {}),
+            matched_tickers,
+        )
+        text = build_auto_notification_report(
+            result,
+            timezone_name=settings.timezone_name,
+            streaks=next_streaks,
+        )
 
         try:
             await send_scheduled_report(
@@ -158,16 +152,17 @@ async def run_auto_report(application: Application, spec: AutoReportSpec) -> Non
             )
         except Exception:
             logger.exception(
-                "Failed to send %s report to chat_id=%s",
-                spec.report_type,
+                "Failed to send auto notification to chat_id=%s timeframe=%s",
                 current_user.chat_id,
+                timeframe,
             )
             continue
 
-        store.record_auto_report(
+        store.record_auto_result(
             user_id=current_user.user_id,
-            report_type=spec.report_type,
+            timeframe=timeframe,
             candle_time=result.latest_candle_time,
+            matched_tickers=matched_tickers,
         )
 
 
@@ -185,32 +180,3 @@ async def send_scheduled_report(
             text=chunk,
             reply_markup=reply_markup,
         )
-
-
-def build_auto_report_text(report_type: ReportType, result) -> str:
-    if report_type == "daily":
-        return build_daily_report(result)
-    if report_type == "weekly":
-        return build_weekly_report(result)
-    return build_monthly_report(result)
-
-
-def is_report_enabled(user: UserSettings, report_type: ReportType) -> bool:
-    if report_type == "daily":
-        return user.auto_daily_report
-    if report_type == "weekly":
-        return user.auto_weekly_report
-    return user.auto_monthly_report
-
-
-def get_last_sent_candle(user: UserSettings, report_type: ReportType) -> str | None:
-    if report_type == "daily":
-        return user.last_sent_daily_candle
-    if report_type == "weekly":
-        return user.last_sent_weekly_candle
-    return user.last_sent_monthly_candle
-
-
-def split_report_time(value: str) -> tuple[int, int]:
-    hour, minute = value.split(":", 1)
-    return int(hour), int(minute)

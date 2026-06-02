@@ -12,13 +12,20 @@ from telegram.ext import (
     ContextTypes,
 )
 
-from analytics import build_growth_report, build_turnover_report, collect_moex_analysis
+from analytics import (
+    TRADING_CONDITION_TEXT,
+    build_manual_report,
+    build_turnover_report,
+    collect_moex_analysis,
+)
 from config import SUPPORTED_TIMEFRAMES, Settings, load_settings
 from keyboards import (
     CALLBACK_CHECK_NOW,
     CALLBACK_HELP,
     CALLBACK_LAST_REPORT,
     CALLBACK_MAIN_MENU,
+    CALLBACK_NOTIFICATION_TIMEFRAME_MENU,
+    CALLBACK_NOTIFICATION_TIMEFRAME_PREFIX,
     CALLBACK_NOTIFICATIONS,
     CALLBACK_RESTART,
     CALLBACK_SETTINGS,
@@ -26,28 +33,37 @@ from keyboards import (
     CALLBACK_TICKERS,
     CALLBACK_TIMEFRAME_MENU,
     CALLBACK_TIMEFRAME_PREFIX,
-    CALLBACK_TOGGLE_DAILY_REPORT,
-    CALLBACK_TOGGLE_MONTHLY_REPORT,
-    CALLBACK_TOGGLE_WEEKLY_REPORT,
+    CALLBACK_TOGGLE_NOTIFICATIONS,
     CALLBACK_VOLUMES,
     after_timeframe_keyboard,
     main_menu_keyboard,
+    notification_timeframe_keyboard,
     notifications_keyboard,
     report_actions_keyboard,
     timeframe_keyboard,
 )
 from scheduler import start_scheduler, stop_scheduler
-from user_settings import UserSettings, UserSettingsStore
+from user_settings import BASE_NOTIFICATION_TIMEFRAMES, UserSettings, UserSettingsStore
 from utils import (
-    enabled_short_label,
+    enabled_label,
     load_tickers,
     split_telegram_message,
+    timeframe_list_label,
     timeframe_label,
 )
 
 
 logger = logging.getLogger(__name__)
 ACCESS_DENIED_TEXT = "⛔ У вас нет доступа к этому боту."
+
+AUTO_CANDLE_PHRASES = {
+    "1m": "минутной",
+    "10m": "10-минутной",
+    "1h": "часовой",
+    "1d": "дневной",
+    "1w": "недельной",
+    "1mo": "месячной",
+}
 
 
 class SecretRedactingFilter(logging.Filter):
@@ -153,7 +169,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Привет. Я отслеживаю российские акции MOEX по закрытым свечам.\n\n"
         f"user_id: {user_settings.user_id}\n"
         f"chat_id: {user_settings.chat_id}\n"
-        f"Текущий таймфрейм: {timeframe_label(user_settings.timeframe)}\n\n"
+        f"Таймфрейм ручной проверки: {timeframe_label(user_settings.timeframe)}\n"
+        "Логика отбора: close последней свечи > high предыдущей свечи.\n\n"
         "Нажмите кнопку в главном меню, чтобы проверить акции сейчас или изменить настройки."
     )
     await send_text(update, context, text, reply_markup=main_menu_keyboard())
@@ -175,7 +192,7 @@ async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     user_settings = ensure_user_settings(update, context)
-    await send_growth_report(update, context, user_settings=user_settings)
+    await send_manual_report(update, context, user_settings=user_settings)
 
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -204,20 +221,24 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await set_timeframe(update, context, data)
     elif data == CALLBACK_NOTIFICATIONS:
         await send_notifications_menu(update, context, user_settings=user_settings)
-    elif data == CALLBACK_TOGGLE_DAILY_REPORT:
-        await toggle_report_notification(update, context, report_type="daily")
-    elif data == CALLBACK_TOGGLE_WEEKLY_REPORT:
-        await toggle_report_notification(update, context, report_type="weekly")
-    elif data == CALLBACK_TOGGLE_MONTHLY_REPORT:
-        await toggle_report_notification(update, context, report_type="monthly")
+    elif data == CALLBACK_NOTIFICATION_TIMEFRAME_MENU:
+        await send_notification_timeframe_menu(
+            update,
+            context,
+            user_settings=user_settings,
+        )
+    elif data.startswith(CALLBACK_NOTIFICATION_TIMEFRAME_PREFIX):
+        await set_notification_timeframe(update, context, data)
+    elif data == CALLBACK_TOGGLE_NOTIFICATIONS:
+        await toggle_auto_notifications(update, context)
     elif data == CALLBACK_CHECK_NOW:
-        await send_growth_report(update, context, user_settings=user_settings)
+        await send_manual_report(update, context, user_settings=user_settings)
     elif data == CALLBACK_LAST_REPORT:
         await send_last_report(update, context, user_settings=user_settings)
     elif data == CALLBACK_VOLUMES:
         await send_turnover_report(update, context, user_settings=user_settings)
     elif data == CALLBACK_TICKERS:
-        await send_tickers(update, context, user_settings=user_settings)
+        await send_tickers(update, context)
     elif data == CALLBACK_SETTINGS:
         await send_settings(update, context, user_settings=user_settings)
     elif data == CALLBACK_HELP:
@@ -241,12 +262,12 @@ async def send_start_panel(
     text = (
         "▶️ Старт\n\n"
         "Текущие настройки:\n"
-        f"Таймфрейм: {timeframe_label(user_settings.timeframe)}\n"
-        f"Дневной отчёт: {enabled_short_label(user_settings.auto_daily_report)}\n"
-        f"Недельный отчёт: {enabled_short_label(user_settings.auto_weekly_report)}\n"
-        f"Месячный отчёт: {enabled_short_label(user_settings.auto_monthly_report)}\n"
+        f"Таймфрейм ручной проверки: {timeframe_label(user_settings.timeframe)}\n"
+        f"Таймфреймы автоуведомлений: {timeframe_list_label(user_settings.notification_timeframes)}\n"
+        f"Уведомления: {enabled_label(user_settings.auto_notifications_enabled)}\n"
         f"Количество тикеров: {tickers_count}\n"
-        "Источник данных: MOEX ISS API"
+        "Источник данных: MOEX ISS API\n"
+        f"Логика отбора: {TRADING_CONDITION_TEXT}"
     )
     await send_text(update, context, text, reply_markup=main_menu_keyboard())
 
@@ -258,10 +279,9 @@ async def send_main_menu(
 ) -> None:
     text = (
         "Главное меню\n\n"
-        f"Таймфрейм: {timeframe_label(user_settings.timeframe)}\n"
-        f"Дневной отчёт: {enabled_short_label(user_settings.auto_daily_report)}\n"
-        f"Недельный отчёт: {enabled_short_label(user_settings.auto_weekly_report)}\n"
-        f"Месячный отчёт: {enabled_short_label(user_settings.auto_monthly_report)}"
+        f"Таймфрейм ручной проверки: {timeframe_label(user_settings.timeframe)}\n"
+        f"Таймфреймы автоуведомлений: {timeframe_list_label(user_settings.notification_timeframes)}\n"
+        f"Уведомления: {enabled_label(user_settings.auto_notifications_enabled)}"
     )
     await send_text(update, context, text, reply_markup=main_menu_keyboard())
 
@@ -279,10 +299,9 @@ async def restart_user_settings(
     user_settings = store.reset_user(user_id=user.id, chat_id=chat.id)
     text = (
         "✅ Настройки сброшены. История диалога сохранена.\n\n"
-        f"Таймфрейм: {timeframe_label(user_settings.timeframe)}\n"
-        f"Дневной отчёт: {enabled_short_label(user_settings.auto_daily_report)}\n"
-        f"Недельный отчёт: {enabled_short_label(user_settings.auto_weekly_report)}\n"
-        f"Месячный отчёт: {enabled_short_label(user_settings.auto_monthly_report)}"
+        f"Таймфрейм ручной проверки: {timeframe_label(user_settings.timeframe)}\n"
+        f"Таймфреймы автоуведомлений: {timeframe_list_label(user_settings.notification_timeframes)}\n"
+        f"Уведомления: {enabled_label(user_settings.auto_notifications_enabled)}"
     )
     await send_text(update, context, text, reply_markup=main_menu_keyboard())
 
@@ -294,7 +313,7 @@ async def send_timeframe_menu(
     await send_text(
         update,
         context,
-        "⏱ Выберите таймфрейм:",
+        "⏱ Выберите таймфрейм ручной проверки:",
         reply_markup=timeframe_keyboard(),
     )
 
@@ -320,9 +339,8 @@ async def set_timeframe(
         return
     store.set_timeframe(user.id, timeframe)
     text = (
-        f"✅ Таймфрейм выбран: {timeframe_label(timeframe)}\n\n"
-        "Теперь бот будет сравнивать закрытие последней и предпоследней "
-        "закрытой свечи на этом таймфрейме."
+        f"✅ Таймфрейм ручной проверки выбран: {timeframe_label(timeframe)}\n\n"
+        f"Теперь бот будет проверять условие: {TRADING_CONDITION_TEXT}."
     )
     await send_text(update, context, text, reply_markup=after_timeframe_keyboard())
 
@@ -335,52 +353,92 @@ async def send_notifications_menu(
 ) -> None:
     text = (
         "🔔 Уведомления\n\n"
-        f"Дневной отчёт: {enabled_short_label(user_settings.auto_daily_report)}\n"
-        f"Недельный отчёт: {enabled_short_label(user_settings.auto_weekly_report)}\n"
-        f"Месячный отчёт: {enabled_short_label(user_settings.auto_monthly_report)}"
+        f"Таймфреймы автоуведомлений: "
+        f"{timeframe_list_label(user_settings.notification_timeframes)}\n"
+        f"Статус: {enabled_label(user_settings.auto_notifications_enabled)}\n\n"
+        "1 день, 1 неделя и 1 месяц включены в базовом наборе. "
+        "Короткие таймфреймы можно добавить отдельно."
     )
     await send_text(update, context, text, reply_markup=notifications_keyboard())
 
 
-async def toggle_report_notification(
+async def send_notification_timeframe_menu(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
     *,
-    report_type: str,
+    user_settings: UserSettings,
+) -> None:
+    await send_text(
+        update,
+        context,
+        "⏱ Выберите таймфрейм уведомлений:\n\n"
+        "✅ отмечены уже включённые. 1 день, 1 неделя и 1 месяц включены по умолчанию.",
+        reply_markup=notification_timeframe_keyboard(user_settings.notification_timeframes),
+    )
+
+
+async def set_notification_timeframe(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    callback_data: str,
+) -> None:
+    timeframe = callback_data.removeprefix(CALLBACK_NOTIFICATION_TIMEFRAME_PREFIX)
+    if timeframe not in SUPPORTED_TIMEFRAMES:
+        await send_text(
+            update,
+            context,
+            "Этот таймфрейм не поддерживается.",
+            reply_markup=notification_timeframe_keyboard(),
+        )
+        return
+
+    store = get_user_settings_store(context)
+    user = update.effective_user
+    if user is None:
+        return
+    user_settings = store.toggle_notification_timeframe(user.id, timeframe)
+    candle_phrase = AUTO_CANDLE_PHRASES.get(timeframe, timeframe_label(timeframe))
+    if timeframe in BASE_NOTIFICATION_TIMEFRAMES:
+        text = (
+            f"✅ {timeframe_label(timeframe)} уже включён по умолчанию.\n\n"
+            "Дневные, недельные и месячные уведомления остаются включёнными "
+            "в базовом наборе."
+        )
+    elif timeframe in user_settings.notification_timeframes:
+        text = (
+            f"✅ Таймфрейм уведомлений добавлен: {timeframe_label(timeframe)}\n\n"
+            f"Теперь бот будет отправлять уведомления после закрытия каждой новой "
+            f"{candle_phrase} свечи, если найдёт тикеры, у которых close последней "
+            "свечи выше high предыдущей свечи.\n\n"
+            "Базовые уведомления за 1 день, 1 неделю и 1 месяц остаются включёнными."
+        )
+    else:
+        text = (
+            f"☑️ Таймфрейм уведомлений отключён: {timeframe_label(timeframe)}\n\n"
+            "Базовые уведомления за 1 день, 1 неделю и 1 месяц остаются включёнными."
+        )
+    await send_text(
+        update,
+        context,
+        text,
+        reply_markup=notification_timeframe_keyboard(user_settings.notification_timeframes),
+    )
+
+
+async def toggle_auto_notifications(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
     store = get_user_settings_store(context)
     user = update.effective_user
     if user is None:
         return
 
-    if report_type == "daily":
-        user_settings = store.toggle_daily_report(user.id)
-        name = "Дневной отчёт"
-        enabled = user_settings.auto_daily_report
-    elif report_type == "weekly":
-        user_settings = store.toggle_weekly_report(user.id)
-        name = "Недельный отчёт"
-        enabled = user_settings.auto_weekly_report
-    else:
-        user_settings = store.toggle_monthly_report(user.id)
-        name = "Месячный отчёт"
-        enabled = user_settings.auto_monthly_report
-
-    await send_text(
-        update,
-        context,
-        (
-            f"🔔 {name}: {enabled_short_label(enabled)}.\n\n"
-            "Уведомления\n\n"
-            f"Дневной отчёт: {enabled_short_label(user_settings.auto_daily_report)}\n"
-            f"Недельный отчёт: {enabled_short_label(user_settings.auto_weekly_report)}\n"
-            f"Месячный отчёт: {enabled_short_label(user_settings.auto_monthly_report)}"
-        ),
-        reply_markup=notifications_keyboard(),
-    )
+    user_settings = store.toggle_auto_notifications(user.id)
+    await send_notifications_menu(update, context, user_settings=user_settings)
 
 
-async def send_growth_report(
+async def send_manual_report(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
     *,
@@ -418,7 +476,7 @@ async def send_growth_report(
     if result.tickers_count == 0:
         text = "В tickers.txt нет тикеров для проверки."
     else:
-        text = build_growth_report(result, timezone_name=settings.timezone_name)
+        text = build_manual_report(result, timezone_name=settings.timezone_name)
 
     store.save_last_report(
         user_id=user_settings.user_id,
@@ -443,7 +501,7 @@ async def send_last_report(
         await send_text(
             update,
             context,
-            "Пока нет сохранённого последнего отчёта. Нажмите ‘Проверить сейчас’.",
+            "Пока нет сохранённого последнего отчёта. Нажмите «Проверить сейчас».",
             reply_markup=report_actions_keyboard(),
         )
         return
@@ -495,8 +553,6 @@ async def send_turnover_report(
 async def send_tickers(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
-    *,
-    user_settings: UserSettings,
 ) -> None:
     settings = get_settings(context)
     try:
@@ -528,25 +584,17 @@ async def send_settings(
     user_settings: UserSettings,
 ) -> None:
     settings = get_settings(context)
-    allowed = (
-        str(settings.allowed_user_id)
-        if settings.allowed_user_id is not None
-        else "не задан"
-    )
     text = (
         "⚙️ Настройки\n\n"
-        f"Таймфрейм для ручной проверки: {timeframe_label(user_settings.timeframe)}\n"
+        f"Таймфрейм ручной проверки: {timeframe_label(user_settings.timeframe)}\n"
+        f"Таймфреймы автоуведомлений: {timeframe_list_label(user_settings.notification_timeframes)}\n"
+        f"Уведомления: {enabled_label(user_settings.auto_notifications_enabled)}\n"
         "Источник данных: MOEX\n"
         f"Количество тикеров: {count_tickers(settings)}\n"
-        f"Дневной отчёт: {enabled_short_label(user_settings.auto_daily_report)}\n"
-        f"Недельный отчёт: {enabled_short_label(user_settings.auto_weekly_report)}\n"
-        f"Месячный отчёт: {enabled_short_label(user_settings.auto_monthly_report)}\n"
-        f"Время дневного отчёта: {settings.daily_report_time}\n"
-        f"Время недельного отчёта: {settings.weekly_report_day} {settings.weekly_report_time}\n"
-        f"Время месячного отчёта: {settings.monthly_report_time}\n"
         f"Timezone: {settings.timezone_name}\n"
         f"chat_id: {user_settings.chat_id}\n"
-        f"allowed user: {allowed}"
+        f"user_id: {user_settings.user_id}\n"
+        f"Логика отбора: {TRADING_CONDITION_TEXT}"
     )
     await send_text(update, context, text, reply_markup=main_menu_keyboard())
 
@@ -561,18 +609,27 @@ async def send_help(
         "Таймфрейм — период одной свечи: 1 минута, 10 минут, 1 час, 1 день, "
         "1 неделя или 1 месяц.\n\n"
         "При проверке бот берёт две последние закрытые свечи выбранного таймфрейма "
-        "и сравнивает их close. В отчёт попадает тикер, если close последней "
-        "закрытой свечи выше close предыдущей закрытой свечи. Объёмы не показываются; "
-        "если MOEX вернул поле value, бот показывает оборот в рублях.\n\n"
-        "Автоуведомления по умолчанию отправляются только для дневного, недельного "
-        "и месячного отчёта. Таймфреймы 1m, 10m и 1h используются только для ручной проверки.\n\n"
+        "и проверяет условие: close последней свечи > high предыдущей свечи. "
+        "Простыми словами: акция закрылась выше максимума предыдущей свечи.\n\n"
+        "Текущая незакрытая свеча не используется. Для 1m и 10m бот берёт готовые "
+        "свечи MOEX ISS без ручной агрегации.\n\n"
+        "Автоуведомления за 1 день, 1 неделю и 1 месяц включены в базовом наборе. "
+        "В разделе уведомлений можно дополнительно включить 1m, 10m или 1h; "
+        "например, 10m будет работать вместе с 1d, 1w и 1mo. Бот проверяет новую "
+        "закрытую свечу примерно раз в минуту и не отправляет пустые автоотчёты, "
+        "если подходящих тикеров нет.\n\n"
+        "Статусы X2, X3, X4 показываются только в автоуведомлениях. X2 означает, "
+        "что тикер второй раз подряд попал в автоотчёт на выбранном таймфрейме. "
+        "Если тикер перестал попадать, счётчик сбрасывается.\n\n"
+        "В отчётах не показывается volume. Если MOEX вернул поле value, бот "
+        "показывает оборот в рублях.\n\n"
         "Кнопки:\n"
         "▶️ Старт — показать текущие настройки.\n"
         "🔄 Рестарт — сбросить настройки без удаления истории Telegram.\n"
         "🔍 Проверить сейчас — вручную построить отчёт.\n"
-        "⏱ Таймфрейм — выбрать период свечи.\n"
-        "🔔 Уведомления — включить или выключить дневной, недельный и месячный автоотчёты.\n"
-        "📄 Последний отчёт — показать последний сохранённый отчёт.\n"
+        "⏱ Таймфрейм — выбрать период свечи для ручной проверки.\n"
+        "🔔 Уведомления — добавить короткие таймфреймы к базовым автоуведомлениям.\n"
+        "📄 Последний отчёт — показать последний сохранённый ручной отчёт.\n"
         "💰 Оборот — показать топ-10 тикеров по обороту последней свечи.\n"
         "📋 Мои тикеры — показать список из tickers.txt.\n"
         "⚙️ Настройки — показать параметры бота."
@@ -612,9 +669,8 @@ def main() -> None:
     user_settings_store = UserSettingsStore(
         settings.user_settings_path,
         default_timeframe=settings.default_timeframe,
-        default_auto_daily_report=settings.auto_daily_report,
-        default_auto_weekly_report=settings.auto_weekly_report,
-        default_auto_monthly_report=settings.auto_monthly_report,
+        default_notification_timeframes=settings.default_notification_timeframes,
+        default_auto_notifications=settings.auto_notifications,
     )
 
     application = (

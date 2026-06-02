@@ -10,9 +10,8 @@ CALLBACK_RESTART = "menu:restart"
 CALLBACK_CHECK_NOW = "report:check"
 CALLBACK_TIMEFRAME_MENU = "menu:timeframe"
 CALLBACK_NOTIFICATIONS = "menu:notifications"
-CALLBACK_TOGGLE_DAILY_REPORT = "notify:daily"
-CALLBACK_TOGGLE_WEEKLY_REPORT = "notify:weekly"
-CALLBACK_TOGGLE_MONTHLY_REPORT = "notify:monthly"
+CALLBACK_NOTIFICATION_TIMEFRAME_MENU = "notify:timeframe_menu"
+CALLBACK_TOGGLE_NOTIFICATIONS = "notify:toggle"
 CALLBACK_LAST_REPORT = "menu:last_report"
 CALLBACK_VOLUMES = "menu:volumes"
 CALLBACK_TICKERS = "menu:tickers"
@@ -20,6 +19,7 @@ CALLBACK_SETTINGS = "menu:settings"
 CALLBACK_HELP = "menu:help"
 CALLBACK_MAIN_MENU = "menu:main"
 CALLBACK_TIMEFRAME_PREFIX = "tf:"
+CALLBACK_NOTIFICATION_TIMEFRAME_PREFIX = "notify_tf:"
 
 
 def main_menu_keyboard() -> InlineKeyboardMarkup:
@@ -50,39 +50,66 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
 
 
 def timeframe_keyboard() -> InlineKeyboardMarkup:
+    return build_timeframe_keyboard(CALLBACK_TIMEFRAME_PREFIX, back_to=CALLBACK_MAIN_MENU)
+
+
+def notification_timeframe_keyboard(
+    enabled_timeframes: list[str] | tuple[str, ...] | None = None,
+) -> InlineKeyboardMarkup:
+    return build_timeframe_keyboard(
+        CALLBACK_NOTIFICATION_TIMEFRAME_PREFIX,
+        back_to=CALLBACK_NOTIFICATIONS,
+        enabled_timeframes=enabled_timeframes,
+    )
+
+
+def build_timeframe_keyboard(
+    prefix: str,
+    *,
+    back_to: str,
+    enabled_timeframes: list[str] | tuple[str, ...] | None = None,
+) -> InlineKeyboardMarkup:
+    enabled = set(enabled_timeframes or [])
+
+    def button_label(timeframe: str) -> str:
+        label = TIMEFRAME_LABELS[timeframe]
+        if timeframe in enabled:
+            return f"✅ {label}"
+        return label
+
     return InlineKeyboardMarkup(
         [
             [
                 InlineKeyboardButton(
-                    TIMEFRAME_LABELS["1m"],
-                    callback_data=f"{CALLBACK_TIMEFRAME_PREFIX}1m",
+                    button_label("1m"),
+                    callback_data=f"{prefix}1m",
                 ),
                 InlineKeyboardButton(
-                    TIMEFRAME_LABELS["10m"],
-                    callback_data=f"{CALLBACK_TIMEFRAME_PREFIX}10m",
+                    button_label("10m"),
+                    callback_data=f"{prefix}10m",
                 ),
             ],
             [
                 InlineKeyboardButton(
-                    TIMEFRAME_LABELS["1h"],
-                    callback_data=f"{CALLBACK_TIMEFRAME_PREFIX}1h",
+                    button_label("1h"),
+                    callback_data=f"{prefix}1h",
                 ),
                 InlineKeyboardButton(
-                    TIMEFRAME_LABELS["1d"],
-                    callback_data=f"{CALLBACK_TIMEFRAME_PREFIX}1d",
+                    button_label("1d"),
+                    callback_data=f"{prefix}1d",
                 ),
             ],
             [
                 InlineKeyboardButton(
-                    TIMEFRAME_LABELS["1w"],
-                    callback_data=f"{CALLBACK_TIMEFRAME_PREFIX}1w",
+                    button_label("1w"),
+                    callback_data=f"{prefix}1w",
                 ),
                 InlineKeyboardButton(
-                    TIMEFRAME_LABELS["1mo"],
-                    callback_data=f"{CALLBACK_TIMEFRAME_PREFIX}1mo",
+                    button_label("1mo"),
+                    callback_data=f"{prefix}1mo",
                 ),
             ],
-            [InlineKeyboardButton("⬅️ Назад", callback_data=CALLBACK_MAIN_MENU)],
+            [InlineKeyboardButton("⬅️ Назад", callback_data=back_to)],
         ]
     )
 
@@ -100,9 +127,19 @@ def after_timeframe_keyboard() -> InlineKeyboardMarkup:
 def notifications_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("Дневной Вкл/Выкл", callback_data=CALLBACK_TOGGLE_DAILY_REPORT)],
-            [InlineKeyboardButton("Недельный Вкл/Выкл", callback_data=CALLBACK_TOGGLE_WEEKLY_REPORT)],
-            [InlineKeyboardButton("Месячный Вкл/Выкл", callback_data=CALLBACK_TOGGLE_MONTHLY_REPORT)],
+            [
+                InlineKeyboardButton(
+                    "⏱ Добавить/убрать таймфреймы",
+                    callback_data=CALLBACK_NOTIFICATION_TIMEFRAME_MENU,
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "🔔 Включить/выключить уведомления",
+                    callback_data=CALLBACK_TOGGLE_NOTIFICATIONS,
+                )
+            ],
+            [InlineKeyboardButton("🔍 Проверить сейчас", callback_data=CALLBACK_CHECK_NOW)],
             [InlineKeyboardButton("⬅️ Главное меню", callback_data=CALLBACK_MAIN_MENU)],
         ]
     )

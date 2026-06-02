@@ -32,6 +32,10 @@ def timeframe_label(timeframe: str) -> str:
     return TIMEFRAME_LABELS.get(timeframe, timeframe)
 
 
+def timeframe_list_label(timeframes: list[str] | tuple[str, ...]) -> str:
+    return ", ".join(timeframe_label(timeframe) for timeframe in timeframes)
+
+
 def timezone_label(timezone_name: str) -> str:
     if timezone_name == "Europe/Moscow":
         return "МСК"

@@ -26,6 +26,14 @@ MONTH_NAMES = {
     12: "декабрь",
 }
 
+INTRADAY_TIMEFRAME_MINUTES = {
+    "1m": 1,
+    "10m": 10,
+    "1h": 60,
+}
+
+TRADING_CONDITION_TEXT = "close последней свечи > high предыдущей свечи"
+
 
 @dataclass(frozen=True)
 class CandleComparison:
@@ -33,7 +41,7 @@ class CandleComparison:
     last: Candle
     previous: Candle
     percent_change: float
-    is_growth: bool
+    matches_condition: bool
 
 
 @dataclass(frozen=True)
@@ -46,22 +54,33 @@ class AnalysisResult:
     tickers_count: int
 
     @property
-    def growth_items(self) -> list[CandleComparison]:
-        return [item for item in self.comparisons if item.is_growth]
-
-    @property
-    def turnover_items(self) -> list[CandleComparison]:
-        return sorted(
-            [item for item in self.comparisons if item.last.value is not None],
-            key=lambda item: item.last.value or 0,
-            reverse=True,
-        )
-
-    @property
     def reference_comparison(self) -> CandleComparison | None:
         if not self.comparisons:
             return None
         return max(self.comparisons, key=lambda item: item.last.end)
+
+    @property
+    def current_period_items(self) -> list[CandleComparison]:
+        reference = self.reference_comparison
+        if reference is None:
+            return []
+        return [
+            item
+            for item in self.comparisons
+            if item.last.end == reference.last.end
+        ]
+
+    @property
+    def matched_items(self) -> list[CandleComparison]:
+        return [item for item in self.current_period_items if item.matches_condition]
+
+    @property
+    def turnover_items(self) -> list[CandleComparison]:
+        return sorted(
+            [item for item in self.current_period_items if item.last.value is not None],
+            key=lambda item: item.last.value or 0,
+            reverse=True,
+        )
 
 
 def collect_moex_analysis(settings: Settings, timeframe: str) -> AnalysisResult:
@@ -133,7 +152,7 @@ def compare_last_two_candles(candles: list[Candle]) -> CandleComparison:
         last=last,
         previous=previous,
         percent_change=percent,
-        is_growth=last.close > previous.close,
+        matches_condition=last.close > previous.high,
     )
 
 
@@ -143,35 +162,26 @@ def calculate_percent_change(last_close: float, previous_close: float) -> float:
     return (last_close - previous_close) / previous_close * 100
 
 
-def format_turnover(value: float) -> str:
-    if value >= 1_000_000_000:
-        return f"{format_compact_number(value / 1_000_000_000)} млрд ₽"
-    if value >= 1_000_000:
-        return f"{format_compact_number(value / 1_000_000)} млн ₽"
-    if value >= 1_000:
-        return f"{int(value // 1_000)} тыс ₽"
-    return f"{format_compact_number(value)} ₽"
-
-
-def build_growth_report(result: AnalysisResult, *, timezone_name: str) -> str:
-    label = timeframe_label(result.timeframe)
+def build_manual_report(result: AnalysisResult, *, timezone_name: str) -> str:
     lines: list[str] = [
-        "📈 Акции выше предыдущей свечи",
-        f"Таймфрейм: {label}",
-        "Используются только закрытые свечи.",
+        "🔍 Проверка по закрытым свечам",
+        f"Таймфрейм: {timeframe_label(result.timeframe)}",
+        "",
+        "Условие:",
+        TRADING_CONDITION_TEXT,
         "",
     ]
     lines.extend(format_reference_period_lines(result, timezone_name=timezone_name))
 
-    growth_items = result.growth_items
-    if growth_items:
-        append_growth_items(lines, growth_items)
+    matched_items = result.matched_items
+    if matched_items:
+        append_condition_items(lines, matched_items)
     else:
         lines.extend(
             [
                 (
-                    "Сейчас нет акций, у которых последняя закрытая свеча выше "
-                    "предыдущей на выбранном таймфрейме."
+                    "Сейчас нет акций, у которых последняя закрытая свеча закрылась "
+                    "выше high предыдущей свечи на выбранном таймфрейме."
                 ),
                 "",
             ]
@@ -187,16 +197,56 @@ def build_growth_report(result: AnalysisResult, *, timezone_name: str) -> str:
     return "\n".join(lines).strip()
 
 
+def build_auto_notification_report(
+    result: AnalysisResult,
+    *,
+    timezone_name: str,
+    streaks: dict[str, int],
+) -> str:
+    lines: list[str] = [
+        "🔔 Автоуведомление MOEX",
+        f"Таймфрейм: {timeframe_label(result.timeframe)}",
+        "",
+        "Условие:",
+        TRADING_CONDITION_TEXT,
+        "",
+    ]
+    lines.extend(format_reference_period_lines(result, timezone_name=timezone_name))
+
+    matched_items = result.matched_items
+    if matched_items:
+        append_condition_items(lines, matched_items, streaks=streaks)
+    else:
+        lines.extend(
+            [
+                "Подходящих тикеров на новой закрытой свече нет.",
+                "",
+            ]
+        )
+
+    if result.failures:
+        lines.extend(format_failures(result.failures))
+        lines.append("")
+
+    lines.extend(
+        [
+            f"Обновлено: {result.updated_at:%H:%M} {timezone_label(timezone_name)}",
+            "",
+            "Это не инвестиционная рекомендация.",
+        ]
+    )
+    return "\n".join(lines).strip()
+
+
 def build_turnover_report(
     result: AnalysisResult,
     *,
     timezone_name: str,
     limit: int = 10,
 ) -> str:
-    label = timeframe_label(result.timeframe)
     lines: list[str] = [
         "💰 Оборот",
-        f"Таймфрейм: {label}",
+        f"Таймфрейм: {timeframe_label(result.timeframe)}",
         "Используются только закрытые свечи.",
         "",
     ]
@@ -234,102 +284,32 @@ def build_turnover_report(
     return "\n".join(lines).strip()
 
 
-def build_daily_report(result: AnalysisResult) -> str:
-    lines = [
-        "📅 Дневной отчёт MOEX",
-        "Акции, закрывшиеся выше предыдущего торгового дня",
-        "",
-        "Используются только закрытые дневные свечи.",
-        "",
-    ]
-    reference = result.reference_comparison
-    if reference is not None:
-        lines.extend(
-            [
-                f"Дата последней свечи: {format_date(reference.last.begin)}",
-                f"Дата предыдущей свечи: {format_date(reference.previous.begin)}",
-                "",
-            ]
-        )
-    append_report_body(lines, result)
-    lines.append("Это не инвестиционная рекомендация.")
-    return "\n".join(lines).strip()
-
-
-def build_weekly_report(result: AnalysisResult) -> str:
-    lines = [
-        "📅 Недельный отчёт MOEX",
-        "Акции, закрывшиеся выше предыдущей недели",
-        "",
-        "Используются только закрытые недельные свечи.",
-        "",
-    ]
-    reference = result.reference_comparison
-    if reference is not None:
-        lines.extend(
-            [
-                f"Период последней недели: {format_period(reference.last, '1w')}",
-                f"Период предыдущей недели: {format_period(reference.previous, '1w')}",
-                "",
-            ]
-        )
-    append_report_body(lines, result)
-    lines.append("Это не инвестиционная рекомендация.")
-    return "\n".join(lines).strip()
-
-
-def build_monthly_report(result: AnalysisResult) -> str:
-    lines = [
-        "📅 Месячный отчёт MOEX",
-        "Акции, закрывшиеся выше предыдущего месяца",
-        "",
-        "Используются только закрытые месячные свечи.",
-        "",
-    ]
-    reference = result.reference_comparison
-    if reference is not None:
-        lines.extend(
-            [
-                f"Период последнего месяца: {format_period(reference.last, '1mo')}",
-                f"Период предыдущего месяца: {format_period(reference.previous, '1mo')}",
-                "",
-            ]
-        )
-    append_report_body(lines, result)
-    lines.append("Это не инвестиционная рекомендация.")
-    return "\n".join(lines).strip()
-
-
-def append_report_body(lines: list[str], result: AnalysisResult) -> None:
-    growth_items = result.growth_items
-    if growth_items:
-        append_growth_items(lines, growth_items)
-    else:
-        lines.extend(
-            [
-                "Нет акций, закрывшихся выше предыдущей свечи.",
-                "",
-            ]
-        )
-
-    if result.failures:
-        lines.extend(format_failures(result.failures))
-        lines.append("")
-
-
-def append_growth_items(lines: list[str], items: list[CandleComparison]) -> None:
+def append_condition_items(
+    lines: list[str],
+    items: list[CandleComparison],
+    *,
+    streaks: dict[str, int] | None = None,
+) -> None:
+    streaks = streaks or {}
     for index, item in enumerate(items, start=1):
+        ticker = format_ticker_with_streak(item.ticker, streaks.get(item.ticker, 1))
         lines.extend(
             [
                 (
-                    f"{index}. {item.ticker} — {format_price(item.last.close)} ₽ "
+                    f"{index}. {ticker} — close: {format_price(item.last.close)} ₽ "
                     f"/ {format_percent(item.percent_change)}"
                 ),
-                f"   Пред. close: {format_price(item.previous.close)} ₽",
+                f"   High предыдущей свечи: {format_price(item.previous.high)} ₽",
             ]
         )
         lines.extend(format_turnover_lines(item))
         lines.append("")
+
+
+def format_ticker_with_streak(ticker: str, streak: int) -> str:
+    if streak >= 2:
+        return f"{ticker} (X{streak})"
+    return ticker
 
 
 def format_turnover_lines(item: CandleComparison) -> list[str]:
@@ -352,7 +332,11 @@ def format_reference_period_lines(
     if reference is None:
         return []
 
-    suffix = f" {timezone_label(timezone_name)}" if result.timeframe in {"1m", "10m", "1h"} else ""
+    suffix = (
+        f" {timezone_label(timezone_name)}"
+        if result.timeframe in INTRADAY_TIMEFRAME_MINUTES
+        else ""
+    )
     return [
         f"Период последней свечи: {format_period(reference.last, result.timeframe)}{suffix}",
         f"Период предыдущей свечи: {format_period(reference.previous, result.timeframe)}{suffix}",
@@ -361,13 +345,19 @@ def format_reference_period_lines(
 
 
 def format_period(candle: Candle, timeframe: str) -> str:
-    if timeframe in {"1m", "10m", "1h"}:
-        end = candle.end - timedelta(minutes=1)
+    if timeframe in INTRADAY_TIMEFRAME_MINUTES:
+        end = candle.end
+        if end > candle.begin and end.second == 0 and end.microsecond == 0:
+            end -= timedelta(minutes=1)
         return f"{candle.begin:%H:%M}–{end:%H:%M}"
     if timeframe == "1d":
         return format_date(candle.begin)
     if timeframe == "1w":
-        end = candle.end - timedelta(days=1) if candle.end.date() > candle.begin.date() else candle.end
+        end = (
+            candle.end - timedelta(days=1)
+            if candle.end.date() > candle.begin.date()
+            else candle.end
+        )
         return f"{format_date(candle.begin)}–{format_date(end)}"
     if timeframe == "1mo":
         month = MONTH_NAMES.get(candle.begin.month, f"{candle.begin.month:02d}")
@@ -390,6 +380,16 @@ def format_percent(value: float) -> str:
     return f"{sign}{value:.2f}%"
 
 
+def format_turnover(value: float) -> str:
+    if value >= 1_000_000_000:
+        return f"{format_compact_number(value / 1_000_000_000)} млрд ₽"
+    if value >= 1_000_000:
+        return f"{format_compact_number(value / 1_000_000)} млн ₽"
+    if value >= 1_000:
+        return f"{int(value // 1_000)} тыс ₽"
+    return f"{format_compact_number(value)} ₽"
+
+
 def format_compact_number(value: float) -> str:
     if float(value).is_integer():
         return f"{int(value)}"
@@ -405,9 +405,15 @@ def format_failures(failed: list[tuple[str, str]]) -> list[str]:
 
 def log_missing_turnover(item: CandleComparison) -> None:
     if item.last.value is None:
-        logger.info("%s: MOEX candle field VALUE is missing for last candle", item.ticker)
+        logger.warning(
+            "%s: MOEX candle field VALUE is missing for last candle",
+            item.ticker,
+        )
     if item.previous.value is None:
-        logger.info(
+        logger.warning(
             "%s: MOEX candle field VALUE is missing for previous candle",
             item.ticker,
         )
+
+
+build_growth_report = build_manual_report

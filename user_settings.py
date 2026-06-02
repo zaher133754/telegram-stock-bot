@@ -5,11 +5,14 @@ import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import RLock
-from typing import Any, Literal
+from typing import Any
 
 
 logger = logging.getLogger(__name__)
-ReportType = Literal["daily", "weekly", "monthly"]
+
+SUPPORTED_TIMEFRAMES = ("1m", "10m", "1h", "1d", "1w", "1mo")
+BASE_NOTIFICATION_TIMEFRAMES = ("1d", "1w", "1mo")
+OPTIONAL_NOTIFICATION_TIMEFRAMES = ("1m", "10m", "1h")
 TIMEFRAME_ALIASES = {
     "5m": "1m",
     "15m": "10m",
@@ -28,12 +31,10 @@ class UserSettings:
     chat_id: int
     user_id: int
     selected_timeframe: str
-    auto_daily_report: bool
-    auto_weekly_report: bool
-    auto_monthly_report: bool
-    last_sent_daily_candle: str | None = None
-    last_sent_weekly_candle: str | None = None
-    last_sent_monthly_candle: str | None = None
+    notification_timeframes: list[str]
+    auto_notifications_enabled: bool
+    last_sent_candle_times: dict[str, str] = field(default_factory=dict)
+    streaks: dict[str, dict[str, int]] = field(default_factory=dict)
     last_reports: dict[str, LastReport] = field(default_factory=dict)
 
     @property
@@ -47,15 +48,15 @@ class UserSettingsStore:
         path: Path,
         *,
         default_timeframe: str = "1d",
-        default_auto_daily_report: bool = True,
-        default_auto_weekly_report: bool = True,
-        default_auto_monthly_report: bool = True,
+        default_notification_timeframes: list[str] | tuple[str, ...] | None = None,
+        default_auto_notifications: bool = True,
     ) -> None:
         self.path = path
-        self.default_timeframe = normalize_timeframe(default_timeframe)
-        self.default_auto_daily_report = default_auto_daily_report
-        self.default_auto_weekly_report = default_auto_weekly_report
-        self.default_auto_monthly_report = default_auto_monthly_report
+        self.default_timeframe = normalize_supported_timeframe(default_timeframe)
+        self.default_notification_timeframes = normalize_notification_timeframes(
+            default_notification_timeframes or BASE_NOTIFICATION_TIMEFRAMES
+        )
+        self.default_auto_notifications = default_auto_notifications
         self._lock = RLock()
         self._data: dict[str, Any] = {"users": {}}
         self._load()
@@ -99,9 +100,8 @@ class UserSettingsStore:
                 chat_id=chat_id,
                 user_id=user_id,
                 timeframe="1d",
-                auto_daily_report=True,
-                auto_weekly_report=True,
-                auto_monthly_report=True,
+                notification_timeframes=BASE_NOTIFICATION_TIMEFRAMES,
+                auto_notifications_enabled=True,
             )
             self._save()
             return self._to_user_settings(self._users()[str(user_id)])
@@ -109,19 +109,36 @@ class UserSettingsStore:
     def set_timeframe(self, user_id: int, timeframe: str) -> UserSettings:
         with self._lock:
             raw = self._require_user(user_id)
-            raw["selected_timeframe"] = normalize_timeframe(timeframe)
+            raw["selected_timeframe"] = normalize_supported_timeframe(timeframe)
             raw.pop("timeframe", None)
             self._save()
             return self._to_user_settings(raw)
 
-    def toggle_daily_report(self, user_id: int) -> UserSettings:
-        return self._toggle_report_flag(user_id, "auto_daily_report")
+    def toggle_notification_timeframe(self, user_id: int, timeframe: str) -> UserSettings:
+        normalized_timeframe = normalize_supported_timeframe(timeframe)
+        with self._lock:
+            raw = self._require_user(user_id)
+            current = set(raw["notification_timeframes"])
 
-    def toggle_weekly_report(self, user_id: int) -> UserSettings:
-        return self._toggle_report_flag(user_id, "auto_weekly_report")
+            if normalized_timeframe in BASE_NOTIFICATION_TIMEFRAMES:
+                current.add(normalized_timeframe)
+            elif normalized_timeframe in current:
+                current.remove(normalized_timeframe)
+            else:
+                current.add(normalized_timeframe)
 
-    def toggle_monthly_report(self, user_id: int) -> UserSettings:
-        return self._toggle_report_flag(user_id, "auto_monthly_report")
+            raw["notification_timeframes"] = normalize_notification_timeframes(current)
+            self._save()
+            return self._to_user_settings(raw)
+
+    def toggle_auto_notifications(self, user_id: int) -> UserSettings:
+        with self._lock:
+            raw = self._require_user(user_id)
+            raw["auto_notifications_enabled"] = not bool(
+                raw.get("auto_notifications_enabled", True)
+            )
+            self._save()
+            return self._to_user_settings(raw)
 
     def save_last_report(
         self,
@@ -135,7 +152,7 @@ class UserSettingsStore:
         with self._lock:
             raw = self._require_user(user_id)
             reports = raw.setdefault("last_reports", {})
-            reports[normalize_timeframe(timeframe)] = {
+            reports[normalize_supported_timeframe(timeframe)] = {
                 "text": text,
                 "candle_time": candle_time,
                 "created_at": created_at,
@@ -143,16 +160,27 @@ class UserSettingsStore:
             self._save()
             return self._to_user_settings(raw)
 
-    def record_auto_report(
+    def record_auto_result(
         self,
         *,
         user_id: int,
-        report_type: ReportType,
+        timeframe: str,
         candle_time: str,
+        matched_tickers: list[str],
     ) -> UserSettings:
+        normalized_timeframe = normalize_supported_timeframe(timeframe)
         with self._lock:
             raw = self._require_user(user_id)
-            raw[f"last_sent_{report_type}_candle"] = candle_time
+            last_sent = raw.setdefault("last_sent_candle_times", {})
+            last_sent[normalized_timeframe] = candle_time
+
+            streaks = raw.setdefault("streaks", {})
+            current_streaks = normalize_streaks(streaks).get(normalized_timeframe, {})
+            streaks[normalized_timeframe] = calculate_next_streaks(
+                current_streaks,
+                matched_tickers,
+            )
+            raw["streaks"] = normalize_streaks(streaks)
             self._save()
             return self._to_user_settings(raw)
 
@@ -161,7 +189,7 @@ class UserSettingsStore:
             raw = self._users().get(str(user_id))
             if raw is None:
                 return None
-            report = raw.get("last_reports", {}).get(normalize_timeframe(timeframe))
+            report = raw.get("last_reports", {}).get(normalize_supported_timeframe(timeframe))
             if not isinstance(report, dict):
                 return None
             text = str(report.get("text", ""))
@@ -172,13 +200,6 @@ class UserSettingsStore:
                 candle_time=report.get("candle_time"),
                 created_at=str(report.get("created_at", "")),
             )
-
-    def _toggle_report_flag(self, user_id: int, field: str) -> UserSettings:
-        with self._lock:
-            raw = self._require_user(user_id)
-            raw[field] = not bool(raw.get(field, True))
-            self._save()
-            return self._to_user_settings(raw)
 
     def _load(self) -> None:
         with self._lock:
@@ -213,70 +234,89 @@ class UserSettingsStore:
         chat_id: int,
         user_id: int,
         timeframe: str | None = None,
-        auto_daily_report: bool | None = None,
-        auto_weekly_report: bool | None = None,
-        auto_monthly_report: bool | None = None,
+        notification_timeframes: list[str] | tuple[str, ...] | None = None,
+        auto_notifications_enabled: bool | None = None,
     ) -> dict[str, Any]:
         return {
             "chat_id": chat_id,
             "user_id": user_id,
-            "selected_timeframe": normalize_timeframe(timeframe or self.default_timeframe),
-            "auto_daily_report": (
-                self.default_auto_daily_report
-                if auto_daily_report is None
-                else auto_daily_report
+            "selected_timeframe": normalize_supported_timeframe(
+                timeframe or self.default_timeframe
             ),
-            "auto_weekly_report": (
-                self.default_auto_weekly_report
-                if auto_weekly_report is None
-                else auto_weekly_report
+            "notification_timeframes": normalize_notification_timeframes(
+                notification_timeframes or self.default_notification_timeframes
             ),
-            "auto_monthly_report": (
-                self.default_auto_monthly_report
-                if auto_monthly_report is None
-                else auto_monthly_report
+            "auto_notifications_enabled": (
+                self.default_auto_notifications
+                if auto_notifications_enabled is None
+                else auto_notifications_enabled
             ),
-            "last_sent_daily_candle": None,
-            "last_sent_weekly_candle": None,
-            "last_sent_monthly_candle": None,
+            "last_sent_candle_times": {},
+            "streaks": {},
             "last_reports": {},
         }
 
     def _fill_missing_user_fields(self, raw: dict[str, Any]) -> None:
         old_timeframe = raw.pop("timeframe", None)
         selected_timeframe = raw.get("selected_timeframe", old_timeframe)
-        raw["selected_timeframe"] = normalize_timeframe(
+        raw["selected_timeframe"] = normalize_supported_timeframe(
             str(selected_timeframe or self.default_timeframe)
         )
 
-        old_auto_notifications = raw.pop("auto_notifications", None)
-        fallback_auto = (
-            bool(old_auto_notifications)
-            if old_auto_notifications is not None
-            else None
+        legacy_notification_timeframe = raw.pop("notification_timeframe", None)
+        raw["notification_timeframes"] = normalize_notification_timeframes(
+            [
+                *self.default_notification_timeframes,
+                *to_timeframe_list(raw.get("notification_timeframes", [])),
+                *to_timeframe_list(legacy_notification_timeframe),
+            ]
         )
-        raw.setdefault(
-            "auto_daily_report",
-            fallback_auto
-            if fallback_auto is not None
-            else self.default_auto_daily_report,
+
+        if "auto_notifications_enabled" not in raw:
+            legacy_auto_notifications = raw.pop("auto_notifications", None)
+            legacy_flags = [
+                raw.get("auto_daily_report"),
+                raw.get("auto_weekly_report"),
+                raw.get("auto_monthly_report"),
+            ]
+            legacy_flags = [flag for flag in legacy_flags if flag is not None]
+            if legacy_auto_notifications is not None:
+                raw["auto_notifications_enabled"] = bool(legacy_auto_notifications)
+            elif legacy_flags:
+                raw["auto_notifications_enabled"] = any(bool(flag) for flag in legacy_flags)
+            else:
+                raw["auto_notifications_enabled"] = self.default_auto_notifications
+
+        raw["last_sent_candle_times"] = normalize_last_sent_candle_times(
+            raw.get("last_sent_candle_times", {})
         )
-        raw.setdefault(
-            "auto_weekly_report",
-            fallback_auto
-            if fallback_auto is not None
-            else self.default_auto_weekly_report,
-        )
-        raw.setdefault(
-            "auto_monthly_report",
-            fallback_auto
-            if fallback_auto is not None
-            else self.default_auto_monthly_report,
-        )
-        raw.setdefault("last_sent_daily_candle", None)
-        raw.setdefault("last_sent_weekly_candle", None)
-        raw.setdefault("last_sent_monthly_candle", None)
-        raw.pop("last_sent_candle_time", None)
+        legacy_single_candle = raw.pop("last_sent_candle_time", None)
+        if legacy_single_candle:
+            legacy_timeframe = normalize_supported_timeframe(
+                str(legacy_notification_timeframe or self.default_notification_timeframes[0])
+            )
+            raw["last_sent_candle_times"].setdefault(
+                legacy_timeframe,
+                str(legacy_single_candle),
+            )
+
+        legacy_last_sent = {
+            "1d": raw.get("last_sent_daily_candle"),
+            "1w": raw.get("last_sent_weekly_candle"),
+            "1mo": raw.get("last_sent_monthly_candle"),
+        }
+        for timeframe, candle_time in legacy_last_sent.items():
+            if candle_time:
+                raw["last_sent_candle_times"].setdefault(timeframe, str(candle_time))
+
+        raw.pop("auto_daily_report", None)
+        raw.pop("auto_weekly_report", None)
+        raw.pop("auto_monthly_report", None)
+        raw.pop("last_sent_daily_candle", None)
+        raw.pop("last_sent_weekly_candle", None)
+        raw.pop("last_sent_monthly_candle", None)
+
+        raw["streaks"] = normalize_streaks(raw.get("streaks", {}))
         raw.setdefault("last_reports", {})
         raw["last_reports"] = migrate_last_reports(raw["last_reports"])
 
@@ -296,7 +336,7 @@ class UserSettingsStore:
             text = str(report.get("text", ""))
             if not text:
                 continue
-            reports[normalize_timeframe(str(timeframe))] = LastReport(
+            reports[normalize_supported_timeframe(str(timeframe))] = LastReport(
                 text=text,
                 candle_time=report.get("candle_time"),
                 created_at=str(report.get("created_at", "")),
@@ -305,19 +345,100 @@ class UserSettingsStore:
         return UserSettings(
             chat_id=int(raw["chat_id"]),
             user_id=int(raw["user_id"]),
-            selected_timeframe=normalize_timeframe(str(raw["selected_timeframe"])),
-            auto_daily_report=bool(raw["auto_daily_report"]),
-            auto_weekly_report=bool(raw["auto_weekly_report"]),
-            auto_monthly_report=bool(raw["auto_monthly_report"]),
-            last_sent_daily_candle=raw.get("last_sent_daily_candle"),
-            last_sent_weekly_candle=raw.get("last_sent_weekly_candle"),
-            last_sent_monthly_candle=raw.get("last_sent_monthly_candle"),
+            selected_timeframe=normalize_supported_timeframe(str(raw["selected_timeframe"])),
+            notification_timeframes=normalize_notification_timeframes(
+                raw.get("notification_timeframes", [])
+            ),
+            auto_notifications_enabled=bool(raw["auto_notifications_enabled"]),
+            last_sent_candle_times=normalize_last_sent_candle_times(
+                raw.get("last_sent_candle_times", {})
+            ),
+            streaks=normalize_streaks(raw.get("streaks", {})),
             last_reports=reports,
         )
 
 
 def normalize_timeframe(timeframe: str) -> str:
     return TIMEFRAME_ALIASES.get(timeframe.strip().lower(), timeframe.strip().lower())
+
+
+def normalize_supported_timeframe(timeframe: str) -> str:
+    value = normalize_timeframe(timeframe)
+    if value not in SUPPORTED_TIMEFRAMES:
+        return "1d"
+    return value
+
+
+def normalize_notification_timeframes(value: Any) -> list[str]:
+    requested = {
+        normalize_supported_timeframe(timeframe)
+        for timeframe in to_timeframe_list(value)
+    }
+    requested.update(BASE_NOTIFICATION_TIMEFRAMES)
+    return [timeframe for timeframe in SUPPORTED_TIMEFRAMES if timeframe in requested]
+
+
+def to_timeframe_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [part.strip() for part in value.split(",") if part.strip()]
+    if isinstance(value, (list, tuple, set)):
+        return [str(part).strip() for part in value if str(part).strip()]
+    return []
+
+
+def normalize_last_sent_candle_times(value: Any) -> dict[str, str]:
+    if not isinstance(value, dict):
+        return {}
+
+    normalized: dict[str, str] = {}
+    for timeframe, candle_time in value.items():
+        normalized_timeframe = normalize_timeframe(str(timeframe))
+        if normalized_timeframe not in SUPPORTED_TIMEFRAMES or not candle_time:
+            continue
+        normalized[normalized_timeframe] = str(candle_time)
+    return normalized
+
+
+def calculate_next_streaks(
+    current_streaks: dict[str, int],
+    matched_tickers: list[str],
+) -> dict[str, int]:
+    result: dict[str, int] = {}
+    for ticker in matched_tickers:
+        normalized_ticker = ticker.strip().upper()
+        if not normalized_ticker:
+            continue
+        result[normalized_ticker] = int(current_streaks.get(normalized_ticker, 0)) + 1
+    return result
+
+
+def normalize_streaks(value: Any) -> dict[str, dict[str, int]]:
+    if not isinstance(value, dict):
+        return {}
+
+    normalized: dict[str, dict[str, int]] = {}
+    for timeframe, raw_streaks in value.items():
+        normalized_timeframe = normalize_timeframe(str(timeframe))
+        if normalized_timeframe not in SUPPORTED_TIMEFRAMES:
+            continue
+        if not isinstance(raw_streaks, dict):
+            continue
+
+        timeframe_streaks: dict[str, int] = {}
+        for ticker, count in raw_streaks.items():
+            ticker_name = str(ticker).strip().upper()
+            if not ticker_name:
+                continue
+            try:
+                normalized_count = int(count)
+            except (TypeError, ValueError):
+                continue
+            if normalized_count > 0:
+                timeframe_streaks[ticker_name] = normalized_count
+        normalized[normalized_timeframe] = timeframe_streaks
+    return normalized
 
 
 def migrate_last_reports(value: Any) -> dict[str, Any]:
@@ -331,5 +452,7 @@ def migrate_last_reports(value: Any) -> dict[str, Any]:
         text = str(report.get("text", ""))
         if "Объём" in text:
             continue
-        migrated[normalize_timeframe(str(timeframe))] = report
+        normalized_timeframe = normalize_timeframe(str(timeframe))
+        if normalized_timeframe in SUPPORTED_TIMEFRAMES:
+            migrated[normalized_timeframe] = report
     return migrated

@@ -14,15 +14,6 @@ TIMEFRAME_ALIASES = {
     "5m": "1m",
     "15m": "10m",
 }
-WEEKDAYS = {
-    "MONDAY",
-    "TUESDAY",
-    "WEDNESDAY",
-    "THURSDAY",
-    "FRIDAY",
-    "SATURDAY",
-    "SUNDAY",
-}
 
 
 @dataclass(frozen=True)
@@ -34,18 +25,14 @@ class Settings:
     timezone: ZoneInfo
     market: str
     default_timeframe: str
-    auto_daily_report: bool
-    auto_weekly_report: bool
-    auto_monthly_report: bool
-    daily_report_time: str
-    weekly_report_day: str
-    weekly_report_time: str
-    monthly_report_time: str
+    default_notification_timeframes: tuple[str, ...]
+    auto_notifications: bool
     user_settings_path: Path
     tickers_file: Path
     log_file: Path
     moex_board: str
     moex_timeout_seconds: float
+    scheduler_interval_seconds: int
 
 
 def _get_env(name: str, default: str = "") -> str:
@@ -77,34 +64,40 @@ def _bool_from_env(name: str, default: bool) -> bool:
     return value.lower() in {"1", "true", "yes", "y", "on", "да", "вкл"}
 
 
-def _validate_timeframe(value: str) -> str:
-    value = TIMEFRAME_ALIASES.get(value.strip().lower(), value.strip().lower())
-    if value not in SUPPORTED_TIMEFRAMES:
-        allowed = ", ".join(SUPPORTED_TIMEFRAMES)
-        raise ValueError(f"DEFAULT_TIMEFRAME must be one of: {allowed}")
-    return value
-
-
-def _validate_report_time(name: str, value: str) -> str:
-    parts = value.split(":")
-    if len(parts) != 2:
-        raise ValueError(f"{name} must use HH:MM format")
+def _int_from_env(name: str, default: int) -> int:
+    value = _get_env(name)
+    if not value:
+        return default
     try:
-        hour = int(parts[0])
-        minute = int(parts[1])
+        parsed = int(value)
     except ValueError as exc:
-        raise ValueError(f"{name} must use HH:MM format") from exc
-    if not 0 <= hour <= 23 or not 0 <= minute <= 59:
-        raise ValueError(f"{name} hour must be 0-23 and minute must be 0-59")
-    return f"{hour:02d}:{minute:02d}"
+        raise ValueError(f"{name} must be an integer") from exc
+    if parsed <= 0:
+        raise ValueError(f"{name} must be greater than zero")
+    return parsed
 
 
-def _validate_weekday(value: str) -> str:
-    value = value.strip().upper()
-    if value not in WEEKDAYS:
-        allowed = ", ".join(sorted(WEEKDAYS))
-        raise ValueError(f"WEEKLY_REPORT_DAY must be one of: {allowed}")
-    return value
+def _validate_timeframe(name: str, value: str) -> str:
+    normalized = TIMEFRAME_ALIASES.get(value.strip().lower(), value.strip().lower())
+    if normalized not in SUPPORTED_TIMEFRAMES:
+        allowed = ", ".join(SUPPORTED_TIMEFRAMES)
+        raise ValueError(f"{name} must be one of: {allowed}")
+    return normalized
+
+
+def _validate_timeframes(name: str, value: str) -> tuple[str, ...]:
+    raw_values = [part.strip() for part in value.split(",") if part.strip()]
+    if not raw_values:
+        raw_values = ["1d", "1w", "1mo"]
+
+    normalized = {
+        _validate_timeframe(name, raw_value)
+        for raw_value in raw_values
+    }
+    normalized.update({"1d", "1w", "1mo"})
+    return tuple(
+        timeframe for timeframe in SUPPORTED_TIMEFRAMES if timeframe in normalized
+    )
 
 
 def load_settings() -> Settings:
@@ -139,26 +132,22 @@ def load_settings() -> Settings:
         timezone_name=timezone_name,
         timezone=timezone,
         market=market,
-        default_timeframe=_validate_timeframe(_get_env("DEFAULT_TIMEFRAME", "1d")),
-        auto_daily_report=_bool_from_env("AUTO_DAILY_REPORT", True),
-        auto_weekly_report=_bool_from_env("AUTO_WEEKLY_REPORT", True),
-        auto_monthly_report=_bool_from_env("AUTO_MONTHLY_REPORT", True),
-        daily_report_time=_validate_report_time(
-            "DAILY_REPORT_TIME",
-            _get_env("DAILY_REPORT_TIME", "23:55"),
+        default_timeframe=_validate_timeframe(
+            "DEFAULT_TIMEFRAME",
+            _get_env("DEFAULT_TIMEFRAME", "1d"),
         ),
-        weekly_report_day=_validate_weekday(_get_env("WEEKLY_REPORT_DAY", "FRIDAY")),
-        weekly_report_time=_validate_report_time(
-            "WEEKLY_REPORT_TIME",
-            _get_env("WEEKLY_REPORT_TIME", "23:55"),
+        default_notification_timeframes=_validate_timeframes(
+            "DEFAULT_NOTIFICATION_TIMEFRAMES",
+            _get_env(
+                "DEFAULT_NOTIFICATION_TIMEFRAMES",
+                _get_env("DEFAULT_NOTIFICATION_TIMEFRAME", "1d,1w,1mo"),
+            ),
         ),
-        monthly_report_time=_validate_report_time(
-            "MONTHLY_REPORT_TIME",
-            _get_env("MONTHLY_REPORT_TIME", "23:55"),
-        ),
+        auto_notifications=_bool_from_env("AUTO_NOTIFICATIONS", True),
         user_settings_path=_path_from_env("USER_SETTINGS_PATH", "user_settings.json"),
         tickers_file=_path_from_env("TICKERS_FILE", "tickers.txt"),
         log_file=_path_from_env("LOG_FILE", "bot.log"),
         moex_board=_get_env("MOEX_BOARD", "TQBR").upper(),
         moex_timeout_seconds=timeout_seconds,
+        scheduler_interval_seconds=_int_from_env("SCHEDULER_INTERVAL_SECONDS", 60),
     )
