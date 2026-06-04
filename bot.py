@@ -5,6 +5,7 @@ import logging
 from pathlib import Path
 
 from telegram import InlineKeyboardMarkup, Update
+from telegram.error import TelegramError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -20,10 +21,8 @@ from analytics import (
 )
 from config import SUPPORTED_TIMEFRAMES, Settings, load_settings
 from keyboards import (
-    CALLBACK_CHECK_NOW,
     CALLBACK_HELP,
     CALLBACK_LAST_REPORT,
-    CALLBACK_MAIN_MENU,
     CALLBACK_NOTIFICATION_TIMEFRAME_MENU,
     CALLBACK_NOTIFICATION_TIMEFRAME_PREFIX,
     CALLBACK_NOTIFICATIONS,
@@ -31,13 +30,17 @@ from keyboards import (
     CALLBACK_SETTINGS,
     CALLBACK_START_PANEL,
     CALLBACK_TICKERS,
-    CALLBACK_TIMEFRAME_MENU,
     CALLBACK_TIMEFRAME_PREFIX,
     CALLBACK_TOGGLE_NOTIFICATIONS,
     CALLBACK_VOLUMES,
+    MAIN_MENU,
+    REFRESH,
+    TIMEFRAME_MENU,
     after_timeframe_keyboard,
     main_menu_keyboard,
+    main_menu_only_keyboard,
     notification_timeframe_keyboard,
+    normalize_callback_data,
     notifications_keyboard,
     report_actions_keyboard,
     timeframe_keyboard,
@@ -55,6 +58,10 @@ from utils import (
 
 logger = logging.getLogger(__name__)
 ACCESS_DENIED_TEXT = "⛔ У вас нет доступа к этому боту."
+TELEGRAM_CONNECTION_POOL_SIZE = 32
+TELEGRAM_GET_UPDATES_POOL_SIZE = 2
+TELEGRAM_POOL_TIMEOUT_SECONDS = 5
+TELEGRAM_CONCURRENT_UPDATES = 16
 
 AUTO_CANDLE_PHRASES = {
     "1m": "минутной",
@@ -196,26 +203,39 @@ async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    settings = get_settings(context)
-    if not is_user_allowed(update, settings):
-        await deny_access(update)
-        return
-
     query = update.callback_query
     if query is None:
         return
-    await query.answer()
+
+    raw_data = str(query.data or "")
+    user_id = update.effective_user.id if update.effective_user is not None else None
+    logger.info("Callback received: user_id=%s data=%s", user_id, raw_data)
+
+    try:
+        await query.answer()
+    except TelegramError:
+        logger.exception(
+            "Failed to answer callback: user_id=%s data=%s",
+            user_id,
+            raw_data,
+        )
+
+    settings = get_settings(context)
+    if not is_user_allowed(update, settings):
+        if query.message is not None:
+            await query.message.reply_text(ACCESS_DENIED_TEXT)
+        return
 
     user_settings = ensure_user_settings(update, context)
-    data = query.data or ""
+    data = normalize_callback_data(raw_data)
 
     if data == CALLBACK_START_PANEL:
         await send_start_panel(update, context, user_settings)
-    elif data == CALLBACK_MAIN_MENU:
+    elif data == MAIN_MENU:
         await send_main_menu(update, context, user_settings)
     elif data == CALLBACK_RESTART:
         await restart_user_settings(update, context)
-    elif data == CALLBACK_TIMEFRAME_MENU:
+    elif data == TIMEFRAME_MENU:
         await send_timeframe_menu(update, context)
     elif data.startswith(CALLBACK_TIMEFRAME_PREFIX):
         await set_timeframe(update, context, data)
@@ -231,7 +251,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await set_notification_timeframe(update, context, data)
     elif data == CALLBACK_TOGGLE_NOTIFICATIONS:
         await toggle_auto_notifications(update, context)
-    elif data == CALLBACK_CHECK_NOW:
+    elif data == REFRESH:
         await send_manual_report(update, context, user_settings=user_settings)
     elif data == CALLBACK_LAST_REPORT:
         await send_last_report(update, context, user_settings=user_settings)
@@ -247,8 +267,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await send_text(
             update,
             context,
-            "Неизвестная кнопка. Вернитесь в главное меню.",
-            reply_markup=main_menu_keyboard(),
+            "Неизвестная команда. Откройте главное меню.",
+            reply_markup=main_menu_only_keyboard(),
         )
 
 
@@ -482,7 +502,7 @@ async def send_manual_report(
         user_id=user_settings.user_id,
         timeframe=user_settings.timeframe,
         text=text,
-        candle_time=result.latest_candle_time,
+        candle_time=result.latest_candle_key,
         created_at=result.updated_at.isoformat(),
     )
 
@@ -618,8 +638,8 @@ async def send_help(
         "например, 10m будет работать вместе с 1d, 1w и 1mo. Бот проверяет новую "
         "закрытую свечу примерно раз в минуту и не отправляет пустые автоотчёты, "
         "если подходящих тикеров нет.\n\n"
-        "Статусы X2, X3, X4 показываются только в автоуведомлениях. X2 означает, "
-        "что тикер второй раз подряд попал в автоотчёт на выбранном таймфрейме. "
+        "Статусы X2, X3, X4 и далее показываются только в автоуведомлениях. X2 означает, "
+        "что тикер второй раз подряд попал в выборку на разных закрытых свечах выбранного таймфрейма. "
         "Если тикер перестал попадать, счётчик сбрасывается.\n\n"
         "В отчётах не показывается volume. Если MOEX вернул поле value, бот "
         "показывает оборот в рублях.\n\n"
@@ -659,7 +679,7 @@ async def post_init(application: Application) -> None:
 
 
 async def post_shutdown(application: Application) -> None:
-    stop_scheduler(application)
+    await stop_scheduler(application)
 
 
 def main() -> None:
@@ -676,6 +696,11 @@ def main() -> None:
     application = (
         Application.builder()
         .token(settings.telegram_bot_token)
+        .connection_pool_size(TELEGRAM_CONNECTION_POOL_SIZE)
+        .pool_timeout(TELEGRAM_POOL_TIMEOUT_SECONDS)
+        .get_updates_connection_pool_size(TELEGRAM_GET_UPDATES_POOL_SIZE)
+        .get_updates_pool_timeout(TELEGRAM_POOL_TIMEOUT_SECONDS)
+        .concurrent_updates(TELEGRAM_CONCURRENT_UPDATES)
         .post_init(post_init)
         .post_shutdown(post_shutdown)
         .build()

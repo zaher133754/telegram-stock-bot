@@ -5,10 +5,12 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from utils import TIMEFRAME_LABELS
 
 
+MAIN_MENU = "main_menu"
+REFRESH = "refresh"
+TIMEFRAME_MENU = "timeframe_menu"
+
 CALLBACK_START_PANEL = "menu:start"
 CALLBACK_RESTART = "menu:restart"
-CALLBACK_CHECK_NOW = "report:check"
-CALLBACK_TIMEFRAME_MENU = "menu:timeframe"
 CALLBACK_NOTIFICATIONS = "menu:notifications"
 CALLBACK_NOTIFICATION_TIMEFRAME_MENU = "notify:timeframe_menu"
 CALLBACK_TOGGLE_NOTIFICATIONS = "notify:toggle"
@@ -17,9 +19,18 @@ CALLBACK_VOLUMES = "menu:volumes"
 CALLBACK_TICKERS = "menu:tickers"
 CALLBACK_SETTINGS = "menu:settings"
 CALLBACK_HELP = "menu:help"
-CALLBACK_MAIN_MENU = "menu:main"
 CALLBACK_TIMEFRAME_PREFIX = "tf:"
 CALLBACK_NOTIFICATION_TIMEFRAME_PREFIX = "notify_tf:"
+
+LEGACY_CALLBACK_ALIASES = {
+    "menu:main": MAIN_MENU,
+    "report:check": REFRESH,
+    "menu:timeframe": TIMEFRAME_MENU,
+}
+
+
+def normalize_callback_data(data: str) -> str:
+    return LEGACY_CALLBACK_ALIASES.get(data, data)
 
 
 def main_menu_keyboard() -> InlineKeyboardMarkup:
@@ -30,8 +41,8 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton("🔄 Рестарт", callback_data=CALLBACK_RESTART),
             ],
             [
-                InlineKeyboardButton("🔍 Проверить сейчас", callback_data=CALLBACK_CHECK_NOW),
-                InlineKeyboardButton("⏱ Таймфрейм", callback_data=CALLBACK_TIMEFRAME_MENU),
+                InlineKeyboardButton("🔍 Проверить сейчас", callback_data=REFRESH),
+                InlineKeyboardButton("⏱ Таймфрейм", callback_data=TIMEFRAME_MENU),
             ],
             [
                 InlineKeyboardButton("🔔 Уведомления", callback_data=CALLBACK_NOTIFICATIONS),
@@ -50,7 +61,7 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
 
 
 def timeframe_keyboard() -> InlineKeyboardMarkup:
-    return build_timeframe_keyboard(CALLBACK_TIMEFRAME_PREFIX, back_to=CALLBACK_MAIN_MENU)
+    return build_timeframe_keyboard(CALLBACK_TIMEFRAME_PREFIX, back_to=MAIN_MENU)
 
 
 def notification_timeframe_keyboard(
@@ -117,9 +128,9 @@ def build_timeframe_keyboard(
 def after_timeframe_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("🔍 Проверить сейчас", callback_data=CALLBACK_CHECK_NOW)],
+            [InlineKeyboardButton("🔍 Проверить сейчас", callback_data=REFRESH)],
             [InlineKeyboardButton("🔔 Уведомления", callback_data=CALLBACK_NOTIFICATIONS)],
-            [InlineKeyboardButton("⬅️ Главное меню", callback_data=CALLBACK_MAIN_MENU)],
+            [InlineKeyboardButton("⬅️ Главное меню", callback_data=MAIN_MENU)],
         ]
     )
 
@@ -139,8 +150,8 @@ def notifications_keyboard() -> InlineKeyboardMarkup:
                     callback_data=CALLBACK_TOGGLE_NOTIFICATIONS,
                 )
             ],
-            [InlineKeyboardButton("🔍 Проверить сейчас", callback_data=CALLBACK_CHECK_NOW)],
-            [InlineKeyboardButton("⬅️ Главное меню", callback_data=CALLBACK_MAIN_MENU)],
+            [InlineKeyboardButton("🔍 Проверить сейчас", callback_data=REFRESH)],
+            [InlineKeyboardButton("⬅️ Главное меню", callback_data=MAIN_MENU)],
         ]
     )
 
@@ -148,14 +159,14 @@ def notifications_keyboard() -> InlineKeyboardMarkup:
 def report_actions_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("🔄 Обновить", callback_data=CALLBACK_CHECK_NOW)],
-            [InlineKeyboardButton("⏱ Таймфрейм", callback_data=CALLBACK_TIMEFRAME_MENU)],
-            [InlineKeyboardButton("⬅️ Главное меню", callback_data=CALLBACK_MAIN_MENU)],
+            [InlineKeyboardButton("🔄 Обновить", callback_data=REFRESH)],
+            [InlineKeyboardButton("⏱ Таймфрейм", callback_data=TIMEFRAME_MENU)],
+            [InlineKeyboardButton("⬅️ Главное меню", callback_data=MAIN_MENU)],
         ]
     )
 
 
 def main_menu_only_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("⬅️ Главное меню", callback_data=CALLBACK_MAIN_MENU)]]
+        [[InlineKeyboardButton("⬅️ Главное меню", callback_data=MAIN_MENU)]]
     )

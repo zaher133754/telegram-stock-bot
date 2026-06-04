@@ -5,7 +5,13 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, tzinfo
 
 from config import Settings
-from moex_client import Candle, MarketDataError, MoexClient
+from moex_client import (
+    Candle,
+    MarketDataError,
+    MoexClient,
+    candle_close_time,
+    candle_key,
+)
 from utils import load_tickers, timeframe_label, timezone_label
 
 
@@ -32,7 +38,7 @@ INTRADAY_TIMEFRAME_MINUTES = {
     "1h": 60,
 }
 
-TRADING_CONDITION_TEXT = "close последней свечи > high предыдущей свечи"
+TRADING_CONDITION_TEXT = "close последней закрытой свечи > high предыдущей закрытой свечи"
 
 
 @dataclass(frozen=True)
@@ -49,25 +55,42 @@ class AnalysisResult:
     timeframe: str
     comparisons: list[CandleComparison]
     failures: list[tuple[str, str]]
-    latest_candle_time: str | None
     updated_at: datetime
     tickers_count: int
+    moex_requests_count: int = 0
 
     @property
     def reference_comparison(self) -> CandleComparison | None:
         if not self.comparisons:
             return None
-        return max(self.comparisons, key=lambda item: item.last.end)
+        return max(
+            self.comparisons,
+            key=lambda item: candle_key(item.last, self.timeframe),
+        )
+
+    @property
+    def latest_candle_key(self) -> str | None:
+        reference = self.reference_comparison
+        if reference is None:
+            return None
+        return candle_key(reference.last, self.timeframe)
+
+    @property
+    def previous_candle_key(self) -> str | None:
+        reference = self.reference_comparison
+        if reference is None:
+            return None
+        return candle_key(reference.previous, self.timeframe)
 
     @property
     def current_period_items(self) -> list[CandleComparison]:
-        reference = self.reference_comparison
-        if reference is None:
+        latest_candle_key = self.latest_candle_key
+        if latest_candle_key is None:
             return []
         return [
             item
             for item in self.comparisons
-            if item.last.end == reference.last.end
+            if candle_key(item.last, self.timeframe) == latest_candle_key
         ]
 
     @property
@@ -88,14 +111,18 @@ def collect_moex_analysis(settings: Settings, timeframe: str) -> AnalysisResult:
     client = MoexClient(
         board=settings.moex_board,
         timeout=settings.moex_timeout_seconds,
+        retries=settings.moex_request_retries,
         timezone=settings.timezone,
     )
-    return analyze_tickers(
-        client=client,
-        tickers=tickers,
-        timeframe=timeframe,
-        timezone=settings.timezone,
-    )
+    try:
+        return analyze_tickers(
+            client=client,
+            tickers=tickers,
+            timeframe=timeframe,
+            timezone=settings.timezone,
+        )
+    finally:
+        client.close()
 
 
 def analyze_tickers(
@@ -107,7 +134,6 @@ def analyze_tickers(
 ) -> AnalysisResult:
     comparisons: list[CandleComparison] = []
     failures: list[tuple[str, str]] = []
-    latest_candle_times: list[datetime] = []
 
     for ticker in tickers:
         try:
@@ -123,20 +149,15 @@ def analyze_tickers(
             continue
 
         comparisons.append(comparison)
-        latest_candle_times.append(comparison.last.end)
         log_missing_turnover(comparison)
-
-    latest_candle_time = None
-    if latest_candle_times:
-        latest_candle_time = max(latest_candle_times).isoformat()
 
     return AnalysisResult(
         timeframe=timeframe,
         comparisons=comparisons,
         failures=failures,
-        latest_candle_time=latest_candle_time,
         updated_at=datetime.now(timezone),
         tickers_count=len(tickers),
+        moex_requests_count=int(getattr(client, "request_count", 0)),
     )
 
 
@@ -215,7 +236,7 @@ def build_auto_notification_report(
 
     matched_items = result.matched_items
     if matched_items:
-        append_condition_items(lines, matched_items, streaks=streaks)
+        append_auto_condition_items(lines, matched_items, streaks=streaks)
     else:
         lines.extend(
             [
@@ -230,6 +251,83 @@ def build_auto_notification_report(
 
     lines.extend(
         [
+            f"Обновлено: {result.updated_at:%H:%M} {timezone_label(timezone_name)}",
+            "",
+            "Это не инвестиционная рекомендация.",
+        ]
+    )
+    return "\n".join(lines).strip()
+
+
+def build_empty_auto_notification_report(
+    result: AnalysisResult,
+    *,
+    timezone_name: str,
+) -> str:
+    reference = result.reference_comparison
+    if reference is None:
+        raise ValueError("Cannot build an empty report without closed candle data")
+
+    timeframe = result.timeframe
+    if timeframe == "1h":
+        lines = [
+            "🔔 Автоуведомление MOEX",
+            f"Таймфрейм: {timeframe_label(timeframe)}",
+            "",
+            "Условие:",
+            TRADING_CONDITION_TEXT,
+            "",
+            *format_reference_period_lines(result, timezone_name=timezone_name),
+            (
+                "Нет тикеров, у которых close последней закрытой свечи выше "
+                "high предыдущей закрытой свечи."
+            ),
+        ]
+    elif timeframe == "1d":
+        lines = [
+            "📅 Дневной отчёт MOEX",
+            "",
+            "Условие:",
+            "close последней закрытой дневной свечи > high предыдущей дневной свечи",
+            "",
+            f"Дата последней закрытой свечи: {format_date(reference.last.begin)}",
+            f"Дата предыдущей закрытой свечи: {format_date(reference.previous.begin)}",
+            "",
+            "Нет тикеров, которые закрылись выше максимума предыдущего торгового дня.",
+        ]
+    elif timeframe == "1w":
+        lines = [
+            "📅 Недельный отчёт MOEX",
+            "",
+            "Условие:",
+            "close последней закрытой недельной свечи > high предыдущей недельной свечи",
+            "",
+            f"Период последней закрытой недели: {format_period(reference.last, timeframe)}",
+            f"Период предыдущей закрытой недели: {format_period(reference.previous, timeframe)}",
+            "",
+            "Нет тикеров, которые закрылись выше максимума предыдущей недели.",
+        ]
+    elif timeframe == "1mo":
+        lines = [
+            "📅 Месячный отчёт MOEX",
+            "",
+            "Условие:",
+            "close последней закрытой месячной свечи > high предыдущей месячной свечи",
+            "",
+            f"Период последнего закрытого месяца: {format_period(reference.last, timeframe)}",
+            f"Период предыдущего закрытого месяца: {format_period(reference.previous, timeframe)}",
+            "",
+            "Нет тикеров, которые закрылись выше максимума предыдущего месяца.",
+        ]
+    else:
+        raise ValueError(f"Empty auto reports are not supported for {timeframe}")
+
+    if result.failures:
+        lines.extend(["", *format_failures(result.failures)])
+
+    lines.extend(
+        [
+            "",
             f"Обновлено: {result.updated_at:%H:%M} {timezone_label(timezone_name)}",
             "",
             "Это не инвестиционная рекомендация.",
@@ -306,6 +404,29 @@ def append_condition_items(
         lines.append("")
 
 
+def append_auto_condition_items(
+    lines: list[str],
+    items: list[CandleComparison],
+    *,
+    streaks: dict[str, int],
+) -> None:
+    for index, item in enumerate(items, start=1):
+        ticker = format_ticker_with_streak(item.ticker, streaks.get(item.ticker, 1))
+        lines.extend(
+            [
+                f"{index}. {ticker}",
+                f"   Close: {format_price(item.last.close)} ₽",
+                f"   High предыдущей свечи: {format_price(item.previous.high)} ₽",
+                (
+                    "   Пробой high: "
+                    f"{format_percent(calculate_percent_change(item.last.close, item.previous.high))}"
+                ),
+            ]
+        )
+        lines.extend(format_turnover_lines(item))
+        lines.append("")
+
+
 def format_ticker_with_streak(ticker: str, streak: int) -> str:
     if streak >= 2:
         return f"{ticker} (X{streak})"
@@ -338,26 +459,20 @@ def format_reference_period_lines(
         else ""
     )
     return [
-        f"Период последней свечи: {format_period(reference.last, result.timeframe)}{suffix}",
-        f"Период предыдущей свечи: {format_period(reference.previous, result.timeframe)}{suffix}",
+        f"Период последней закрытой свечи: {format_period(reference.last, result.timeframe)}{suffix}",
+        f"Период предыдущей закрытой свечи: {format_period(reference.previous, result.timeframe)}{suffix}",
         "",
     ]
 
 
 def format_period(candle: Candle, timeframe: str) -> str:
     if timeframe in INTRADAY_TIMEFRAME_MINUTES:
-        end = candle.end
-        if end > candle.begin and end.second == 0 and end.microsecond == 0:
-            end -= timedelta(minutes=1)
+        end = candle_close_time(candle, timeframe) - timedelta(minutes=1)
         return f"{candle.begin:%H:%M}–{end:%H:%M}"
     if timeframe == "1d":
         return format_date(candle.begin)
     if timeframe == "1w":
-        end = (
-            candle.end - timedelta(days=1)
-            if candle.end.date() > candle.begin.date()
-            else candle.end
-        )
+        end = candle_close_time(candle, timeframe) - timedelta(days=1)
         return f"{format_date(candle.begin)}–{format_date(end)}"
     if timeframe == "1mo":
         month = MONTH_NAMES.get(candle.begin.month, f"{candle.begin.month:02d}")
@@ -397,10 +512,11 @@ def format_compact_number(value: float) -> str:
 
 
 def format_failures(failed: list[tuple[str, str]]) -> list[str]:
-    lines = ["Не удалось получить данные:"]
-    for ticker, error in failed:
-        lines.append(f"- {ticker}: {error}")
-    return lines
+    tickers = list(dict.fromkeys(ticker for ticker, _error in failed))
+    return [
+        "⚠️ Часть тикеров временно не удалось проверить: "
+        f"{', '.join(tickers)}."
+    ]
 
 
 def log_missing_turnover(item: CandleComparison) -> None:

@@ -33,7 +33,8 @@ class UserSettings:
     selected_timeframe: str
     notification_timeframes: list[str]
     auto_notifications_enabled: bool
-    last_sent_candle_times: dict[str, str] = field(default_factory=dict)
+    last_processed_candle_keys: dict[str, str] = field(default_factory=dict)
+    last_sent_candle_keys: dict[str, str] = field(default_factory=dict)
     streaks: dict[str, dict[str, int]] = field(default_factory=dict)
     last_reports: dict[str, LastReport] = field(default_factory=dict)
 
@@ -165,22 +166,32 @@ class UserSettingsStore:
         *,
         user_id: int,
         timeframe: str,
-        candle_time: str,
+        candle_key: str,
+        previous_candle_key: str | None,
         matched_tickers: list[str],
+        sent: bool = True,
     ) -> UserSettings:
         normalized_timeframe = normalize_supported_timeframe(timeframe)
         with self._lock:
             raw = self._require_user(user_id)
-            last_sent = raw.setdefault("last_sent_candle_times", {})
-            last_sent[normalized_timeframe] = candle_time
+            last_processed = raw.setdefault("last_processed_candle_keys", {})
+            last_processed_candle_key = last_processed.get(normalized_timeframe)
+            if last_processed_candle_key == candle_key:
+                return self._to_user_settings(raw)
 
+            last_sent = raw.setdefault("last_sent_candle_keys", {})
             streaks = raw.setdefault("streaks", {})
             current_streaks = normalize_streaks(streaks).get(normalized_timeframe, {})
-            streaks[normalized_timeframe] = calculate_next_streaks(
+            streaks[normalized_timeframe] = calculate_streaks_for_new_candle(
                 current_streaks,
                 matched_tickers,
+                last_processed_candle_key=last_processed_candle_key,
+                previous_candle_key=previous_candle_key,
             )
             raw["streaks"] = normalize_streaks(streaks)
+            last_processed[normalized_timeframe] = candle_key
+            if sent:
+                last_sent[normalized_timeframe] = candle_key
             self._save()
             return self._to_user_settings(raw)
 
@@ -251,7 +262,8 @@ class UserSettingsStore:
                 if auto_notifications_enabled is None
                 else auto_notifications_enabled
             ),
-            "last_sent_candle_times": {},
+            "last_processed_candle_keys": {},
+            "last_sent_candle_keys": {},
             "streaks": {},
             "last_reports": {},
         }
@@ -287,15 +299,21 @@ class UserSettingsStore:
             else:
                 raw["auto_notifications_enabled"] = self.default_auto_notifications
 
-        raw["last_sent_candle_times"] = normalize_last_sent_candle_times(
-            raw.get("last_sent_candle_times", {})
+        raw["last_sent_candle_keys"] = normalize_last_sent_candle_keys(
+            raw.get("last_sent_candle_keys", {})
         )
+        legacy_candle_times = normalize_last_sent_candle_keys(
+            raw.pop("last_sent_candle_times", {})
+        )
+        for timeframe, candle_key in legacy_candle_times.items():
+            raw["last_sent_candle_keys"].setdefault(timeframe, candle_key)
+
         legacy_single_candle = raw.pop("last_sent_candle_time", None)
         if legacy_single_candle:
             legacy_timeframe = normalize_supported_timeframe(
                 str(legacy_notification_timeframe or self.default_notification_timeframes[0])
             )
-            raw["last_sent_candle_times"].setdefault(
+            raw["last_sent_candle_keys"].setdefault(
                 legacy_timeframe,
                 str(legacy_single_candle),
             )
@@ -307,7 +325,13 @@ class UserSettingsStore:
         }
         for timeframe, candle_time in legacy_last_sent.items():
             if candle_time:
-                raw["last_sent_candle_times"].setdefault(timeframe, str(candle_time))
+                raw["last_sent_candle_keys"].setdefault(timeframe, str(candle_time))
+
+        raw["last_processed_candle_keys"] = normalize_last_sent_candle_keys(
+            raw.get("last_processed_candle_keys", {})
+        )
+        for timeframe, candle_key in raw["last_sent_candle_keys"].items():
+            raw["last_processed_candle_keys"].setdefault(timeframe, candle_key)
 
         raw.pop("auto_daily_report", None)
         raw.pop("auto_weekly_report", None)
@@ -350,8 +374,11 @@ class UserSettingsStore:
                 raw.get("notification_timeframes", [])
             ),
             auto_notifications_enabled=bool(raw["auto_notifications_enabled"]),
-            last_sent_candle_times=normalize_last_sent_candle_times(
-                raw.get("last_sent_candle_times", {})
+            last_processed_candle_keys=normalize_last_sent_candle_keys(
+                raw.get("last_processed_candle_keys", {})
+            ),
+            last_sent_candle_keys=normalize_last_sent_candle_keys(
+                raw.get("last_sent_candle_keys", {})
             ),
             streaks=normalize_streaks(raw.get("streaks", {})),
             last_reports=reports,
@@ -388,7 +415,7 @@ def to_timeframe_list(value: Any) -> list[str]:
     return []
 
 
-def normalize_last_sent_candle_times(value: Any) -> dict[str, str]:
+def normalize_last_sent_candle_keys(value: Any) -> dict[str, str]:
     if not isinstance(value, dict):
         return {}
 
@@ -412,6 +439,18 @@ def calculate_next_streaks(
             continue
         result[normalized_ticker] = int(current_streaks.get(normalized_ticker, 0)) + 1
     return result
+
+
+def calculate_streaks_for_new_candle(
+    current_streaks: dict[str, int],
+    matched_tickers: list[str],
+    *,
+    last_processed_candle_key: str | None,
+    previous_candle_key: str | None,
+) -> dict[str, int]:
+    if last_processed_candle_key != previous_candle_key:
+        current_streaks = {}
+    return calculate_next_streaks(current_streaks, matched_tickers)
 
 
 def normalize_streaks(value: Any) -> dict[str, dict[str, int]]:

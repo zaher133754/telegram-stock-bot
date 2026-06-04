@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, tzinfo
 from typing import Any, Iterable, Protocol
@@ -62,6 +63,11 @@ DIRECT_TIMEFRAME_INTERVALS = {
     "1mo": 31,
 }
 SUPPORTED_TIMEFRAMES = set(DIRECT_TIMEFRAME_INTERVALS)
+INTRADAY_TIMEFRAME_MINUTES = {
+    "1m": 1,
+    "10m": 10,
+    "1h": 60,
+}
 
 
 def get_candles(
@@ -70,11 +76,20 @@ def get_candles(
     limit: int = 2,
     *,
     board: str = "TQBR",
-    timeout: float = 10,
+    timeout: float = 20,
+    retries: int = 3,
     timezone: tzinfo | None = None,
 ) -> list[Candle]:
-    client = MoexClient(board=board, timeout=timeout, timezone=timezone)
-    return client.get_candles(ticker, timeframe, limit=limit)
+    client = MoexClient(
+        board=board,
+        timeout=timeout,
+        retries=retries,
+        timezone=timezone,
+    )
+    try:
+        return client.get_candles(ticker, timeframe, limit=limit)
+    finally:
+        client.close()
 
 
 def get_last_two_closed_candles(
@@ -82,11 +97,20 @@ def get_last_two_closed_candles(
     timeframe: str,
     *,
     board: str = "TQBR",
-    timeout: float = 10,
+    timeout: float = 20,
+    retries: int = 3,
     timezone: tzinfo | None = None,
 ) -> list[Candle]:
-    client = MoexClient(board=board, timeout=timeout, timezone=timezone)
-    return client.get_last_two_closed_candles(ticker, timeframe)
+    client = MoexClient(
+        board=board,
+        timeout=timeout,
+        retries=retries,
+        timezone=timezone,
+    )
+    try:
+        return client.get_last_two_closed_candles(ticker, timeframe)
+    finally:
+        client.close()
 
 
 def normalize_candle_data(
@@ -132,7 +156,7 @@ def normalize_candle_data(
             )
         )
 
-    candles.sort(key=lambda candle: (candle.end, candle.begin))
+    candles.sort(key=lambda candle: _candle_sort_key(candle, timezone))
     return candles
 
 
@@ -159,14 +183,18 @@ class MoexClient:
         self,
         *,
         board: str = "TQBR",
-        timeout: float = 10,
+        timeout: float = 20,
+        retries: int = 3,
         timezone: tzinfo | None = None,
         session: requests.Session | None = None,
     ) -> None:
         self.board = board.upper()
         self.timeout = timeout
+        self.retries = max(1, retries)
         self.timezone = timezone or ZoneInfo("Europe/Moscow")
         self.session = session or requests.Session()
+        self._owns_session = session is None
+        self.request_count = 0
 
     def get_candles(self, ticker: str, timeframe: str, limit: int = 2) -> list[Candle]:
         ticker = ticker.upper()
@@ -179,10 +207,19 @@ class MoexClient:
             ticker,
             interval=interval,
             days_back=_days_back_for_timeframe(timeframe),
+            required_rows=limit + 1,
         )
         candles = normalize_candle_data(ticker, rows, timezone=self.timezone)
 
-        closed = self._closed_candles(candles)
+        current_time = datetime.now(self.timezone)
+        closed = self._closed_candles(candles, timeframe, now=current_time)
+        if timeframe == "1h":
+            self._log_hourly_candle_debug(
+                ticker=ticker,
+                candles=candles,
+                closed_candles=closed,
+                now=current_time,
+            )
         return closed[-limit:]
 
     def get_last_two_closed_candles(self, ticker: str, timeframe: str) -> list[Candle]:
@@ -217,10 +254,12 @@ class MoexClient:
         *,
         interval: int,
         days_back: int,
+        required_rows: int,
     ) -> list[dict[str, Any]]:
         from_date = datetime.now(self.timezone).date() - timedelta(days=days_back)
         rows: list[dict[str, Any]] = []
         start = 0
+        first_page = True
 
         while True:
             payload = self._get_json(
@@ -238,6 +277,18 @@ class MoexClient:
 
             rows.extend(page_rows)
             cursor = self._table_rows(payload, "candles.cursor")
+            if first_page:
+                tail_start = _tail_page_start(
+                    cursor,
+                    required_rows=required_rows,
+                    rows_count=len(page_rows),
+                )
+                first_page = False
+                if tail_start is not None and tail_start > start:
+                    rows = []
+                    start = tail_start
+                    continue
+
             next_start = _next_start(cursor, fallback_start=start, rows_count=len(page_rows))
             if next_start is None or next_start <= start or next_start >= 10000:
                 break
@@ -249,12 +300,32 @@ class MoexClient:
 
     def _get_json(self, path: str, *, params: dict[str, Any]) -> dict[str, Any]:
         url = f"{self.BASE_URL}{path}"
-        try:
-            response = self.session.get(url, params=params, timeout=self.timeout)
-            response.raise_for_status()
-            return response.json()
-        except (requests.RequestException, ValueError) as exc:
-            raise handle_moex_errors(exc) from exc
+        last_error: Exception | None = None
+
+        for attempt in range(1, self.retries + 1):
+            self.request_count += 1
+            try:
+                response = self.session.get(url, params=params, timeout=self.timeout)
+                response.raise_for_status()
+                return response.json()
+            except (requests.RequestException, ValueError) as exc:
+                last_error = exc
+                if attempt >= self.retries or not _is_retryable_error(exc):
+                    raise handle_moex_errors(exc) from exc
+                logger.warning(
+                    "MOEX request retry: attempt=%s/%s url=%s error=%s",
+                    attempt,
+                    self.retries,
+                    url,
+                    exc,
+                )
+                time.sleep(min(0.5 * attempt, 2.0))
+
+        raise handle_moex_errors(last_error or RuntimeError("MOEX request failed"))
+
+    def close(self) -> None:
+        if self._owns_session:
+            self.session.close()
 
     @staticmethod
     def _table_rows(payload: dict[str, Any], table_name: str) -> list[dict[str, Any]]:
@@ -263,11 +334,117 @@ class MoexClient:
         data = table.get("data") or []
         return [dict(zip(columns, row)) for row in data]
 
-    def _closed_candles(self, candles: Iterable[Candle]) -> list[Candle]:
-        now = datetime.now(self.timezone)
-        closed = [candle for candle in candles if candle.end < now]
-        closed.sort(key=lambda candle: (candle.end, candle.begin))
+    def _closed_candles(
+        self,
+        candles: Iterable[Candle],
+        timeframe: str,
+        *,
+        now: datetime | None = None,
+    ) -> list[Candle]:
+        timeframe = _validate_timeframe(timeframe)
+        current_time = _as_timezone(now or datetime.now(self.timezone), self.timezone)
+        closed = [
+            candle
+            for candle in candles
+            if candle_close_time(candle, timeframe, timezone=self.timezone) <= current_time
+        ]
+        closed.sort(key=lambda candle: _candle_sort_key(candle, self.timezone))
         return closed
+
+    def _log_hourly_candle_debug(
+        self,
+        *,
+        ticker: str,
+        candles: list[Candle],
+        closed_candles: list[Candle],
+        now: datetime,
+    ) -> None:
+        now_msk = _as_timezone(now, self.timezone)
+        received = candles[-5:]
+        logger.info(
+            "1h debug: ticker=%s now_msk=%s received_candles=%s",
+            ticker,
+            _format_debug_datetime(now_msk),
+            len(received),
+        )
+        for index, candle in enumerate(received, start=1):
+            is_closed = (
+                candle_close_time(candle, "1h", timezone=self.timezone) <= now_msk
+            )
+            logger.info(
+                "1h debug candle: ticker=%s index=%s begin=%s end=%s close=%s high=%s closed=%s",
+                ticker,
+                index,
+                _format_debug_datetime(_as_timezone(candle.begin, self.timezone)),
+                _format_debug_datetime(_as_timezone(candle.end, self.timezone)),
+                candle.close,
+                candle.high,
+                str(is_closed).lower(),
+            )
+
+        selected_last = closed_candles[-1] if closed_candles else None
+        selected_previous = closed_candles[-2] if len(closed_candles) >= 2 else None
+        logger.info(
+            "1h debug selected: ticker=%s selected_last_closed=%s "
+            "selected_previous_closed=%s candle_key=%s",
+            ticker,
+            _format_debug_datetime(_as_timezone(selected_last.begin, self.timezone))
+            if selected_last
+            else None,
+            _format_debug_datetime(_as_timezone(selected_previous.begin, self.timezone))
+            if selected_previous
+            else None,
+            candle_key(selected_last, "1h", timezone=self.timezone)
+            if selected_last
+            else None,
+        )
+
+
+def candle_close_time(
+    candle: Candle,
+    timeframe: str,
+    *,
+    timezone: tzinfo | None = None,
+) -> datetime:
+    timeframe = _validate_timeframe(timeframe)
+    timezone = timezone or ZoneInfo("Europe/Moscow")
+    begin = _as_timezone(candle.begin, timezone)
+
+    if timeframe in INTRADAY_TIMEFRAME_MINUTES:
+        return begin + timedelta(minutes=INTRADAY_TIMEFRAME_MINUTES[timeframe])
+
+    if timeframe == "1d":
+        next_date = begin.date() + timedelta(days=1)
+        return datetime(next_date.year, next_date.month, next_date.day, tzinfo=timezone)
+
+    if timeframe == "1w":
+        week_start = begin.date() - timedelta(days=begin.weekday())
+        next_week = week_start + timedelta(days=7)
+        return datetime(next_week.year, next_week.month, next_week.day, tzinfo=timezone)
+
+    if begin.month == 12:
+        return datetime(begin.year + 1, 1, 1, tzinfo=timezone)
+    return datetime(begin.year, begin.month + 1, 1, tzinfo=timezone)
+
+
+def candle_key(
+    candle: Candle,
+    timeframe: str,
+    *,
+    timezone: tzinfo | None = None,
+) -> str:
+    timeframe = _validate_timeframe(timeframe)
+    timezone = timezone or ZoneInfo("Europe/Moscow")
+    begin = _as_timezone(candle.begin, timezone)
+
+    if timeframe in INTRADAY_TIMEFRAME_MINUTES:
+        return begin.strftime("%Y-%m-%d %H:%M")
+    if timeframe == "1d":
+        return begin.strftime("%Y-%m-%d")
+    if timeframe == "1w":
+        iso_year, iso_week, _ = begin.isocalendar()
+        return f"{iso_year}-W{iso_week:02d}"
+    return begin.strftime("%Y-%m")
 
 
 def _validate_timeframe(timeframe: str) -> str:
@@ -275,6 +452,15 @@ def _validate_timeframe(timeframe: str) -> str:
     if value not in SUPPORTED_TIMEFRAMES:
         raise MarketDataError(f"Unsupported timeframe: {timeframe}")
     return value
+
+
+def _is_retryable_error(error: Exception) -> bool:
+    if isinstance(error, requests.HTTPError):
+        response = error.response
+        if response is None:
+            return True
+        return response.status_code == 429 or response.status_code >= 500
+    return isinstance(error, (requests.RequestException, ValueError))
 
 
 def _days_back_for_timeframe(timeframe: str) -> int:
@@ -301,6 +487,23 @@ def _parse_moex_datetime(value: Any, timezone: tzinfo) -> datetime | None:
     if parsed.tzinfo is None:
         return parsed.replace(tzinfo=timezone)
     return parsed.astimezone(timezone)
+
+
+def _as_timezone(value: datetime, timezone: tzinfo) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone)
+    return value.astimezone(timezone)
+
+
+def _candle_sort_key(candle: Candle, timezone: tzinfo) -> tuple[datetime, datetime]:
+    return (
+        _as_timezone(candle.begin, timezone),
+        _as_timezone(candle.end, timezone),
+    )
+
+
+def _format_debug_datetime(value: datetime) -> str:
+    return value.isoformat(sep=" ", timespec="seconds")
 
 
 def _pick(row: dict[str, Any], field: str) -> Any:
@@ -344,3 +547,22 @@ def _next_start(
     if rows_count == 0:
         return None
     return fallback_start + rows_count
+
+
+def _tail_page_start(
+    cursor: list[dict[str, Any]],
+    *,
+    required_rows: int,
+    rows_count: int,
+) -> int | None:
+    if not cursor:
+        return None
+
+    row = {str(key).upper(): value for key, value in cursor[0].items()}
+    total = _to_int(row.get("TOTAL"))
+    page_size = _to_int(row.get("PAGESIZE")) or rows_count
+    if total is None or page_size <= 0 or total <= page_size:
+        return None
+
+    tail_size = max(required_rows, page_size)
+    return max(total - tail_size, 0)
