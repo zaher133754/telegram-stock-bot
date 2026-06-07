@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, tzinfo
 
 from config import Settings
@@ -58,6 +58,7 @@ class AnalysisResult:
     updated_at: datetime
     tickers_count: int
     moex_requests_count: int = 0
+    debug_last_candles: list[Candle] = field(default_factory=list)
 
     @property
     def reference_comparison(self) -> CandleComparison | None:
@@ -134,10 +135,20 @@ def analyze_tickers(
 ) -> AnalysisResult:
     comparisons: list[CandleComparison] = []
     failures: list[tuple[str, str]] = []
+    debug_last_candles: list[Candle] = []
 
     for ticker in tickers:
         try:
-            candles = client.get_last_two_closed_candles(ticker, timeframe)
+            if timeframe == "1h":
+                candles = client.get_candles(ticker, timeframe, limit=5)
+                if len(candles) < 2:
+                    raise MarketDataError(
+                        f"{ticker.upper()}: less than two closed candles found for {timeframe}"
+                    )
+                if not debug_last_candles:
+                    debug_last_candles = candles[-5:]
+            else:
+                candles = client.get_last_two_closed_candles(ticker, timeframe)
             comparison = compare_last_two_candles(candles)
         except MarketDataError as exc:
             logger.warning("Failed to get candle data for %s: %s", ticker, exc)
@@ -158,6 +169,7 @@ def analyze_tickers(
         updated_at=datetime.now(timezone),
         tickers_count=len(tickers),
         moex_requests_count=int(getattr(client, "request_count", 0)),
+        debug_last_candles=debug_last_candles,
     )
 
 
@@ -167,7 +179,7 @@ def compare_last_two_candles(candles: list[Candle]) -> CandleComparison:
 
     previous = candles[-2]
     last = candles[-1]
-    percent = calculate_percent_change(last.close, previous.close)
+    percent = calculate_breakout_percent(last.close, previous.high)
     return CandleComparison(
         ticker=last.ticker,
         last=last,
@@ -181,6 +193,10 @@ def calculate_percent_change(last_close: float, previous_close: float) -> float:
     if previous_close == 0:
         return 0.0
     return (last_close - previous_close) / previous_close * 100
+
+
+def calculate_breakout_percent(close_last: float, high_previous: float) -> float:
+    return calculate_percent_change(close_last, high_previous)
 
 
 def build_manual_report(result: AnalysisResult, *, timezone_name: str) -> str:
@@ -244,6 +260,47 @@ def build_auto_notification_report(
                 "",
             ]
         )
+
+    if result.failures:
+        lines.extend(format_failures(result.failures))
+        lines.append("")
+
+    lines.extend(
+        [
+            f"Обновлено: {result.updated_at:%H:%M} {timezone_label(timezone_name)}",
+            "",
+            "Это не инвестиционная рекомендация.",
+        ]
+    )
+    return "\n".join(lines).strip()
+
+
+def build_hourly_supplement_report(
+    result: AnalysisResult,
+    *,
+    timezone_name: str,
+    tickers: list[str],
+    streaks: dict[str, int],
+) -> str:
+    if result.timeframe != "1h":
+        raise ValueError("Hourly supplements are only supported for 1h")
+
+    requested_tickers = {ticker.strip().upper() for ticker in tickers if ticker.strip()}
+    supplement_items = [
+        item
+        for item in result.matched_items
+        if item.ticker.upper() in requested_tickers
+    ]
+
+    lines: list[str] = [
+        "🔔 Дополнение к часовому отчёту",
+        f"Таймфрейм: {timeframe_label(result.timeframe)}",
+        "",
+        "Новые тикеры по той же закрытой часовой свече:",
+        "",
+    ]
+    lines.extend(format_reference_period_lines(result, timezone_name=timezone_name))
+    append_auto_condition_items(lines, supplement_items, streaks=streaks)
 
     if result.failures:
         lines.extend(format_failures(result.failures))
@@ -393,11 +450,9 @@ def append_condition_items(
         ticker = format_ticker_with_streak(item.ticker, streaks.get(item.ticker, 1))
         lines.extend(
             [
-                (
-                    f"{index}. {ticker} — close: {format_price(item.last.close)} ₽ "
-                    f"/ {format_percent(item.percent_change)}"
-                ),
+                f"{index}. {ticker} — close: {format_price(item.last.close)} ₽",
                 f"   High предыдущей свечи: {format_price(item.previous.high)} ₽",
+                f"   Пробой high: {format_percent(item.percent_change)}",
             ]
         )
         lines.extend(format_turnover_lines(item))
@@ -419,7 +474,7 @@ def append_auto_condition_items(
                 f"   High предыдущей свечи: {format_price(item.previous.high)} ₽",
                 (
                     "   Пробой high: "
-                    f"{format_percent(calculate_percent_change(item.last.close, item.previous.high))}"
+                    f"{format_percent(item.percent_change)}"
                 ),
             ]
         )
@@ -478,6 +533,33 @@ def format_period(candle: Candle, timeframe: str) -> str:
         month = MONTH_NAMES.get(candle.begin.month, f"{candle.begin.month:02d}")
         return f"{month} {candle.begin.year}"
     return f"{candle.begin.isoformat()}–{candle.end.isoformat()}"
+
+
+def format_candle_key_period(candle_key_value: str, timeframe: str) -> str:
+    try:
+        if timeframe in INTRADAY_TIMEFRAME_MINUTES:
+            begin = datetime.strptime(candle_key_value, "%Y-%m-%d %H:%M")
+            end = begin + timedelta(minutes=INTRADAY_TIMEFRAME_MINUTES[timeframe] - 1)
+            return f"{begin:%H:%M}–{end:%H:%M}"
+
+        if timeframe == "1d":
+            return format_date(datetime.strptime(candle_key_value, "%Y-%m-%d"))
+
+        if timeframe == "1w":
+            year_part, week_part = candle_key_value.split("-W", 1)
+            begin = datetime.fromisocalendar(int(year_part), int(week_part), 1)
+            end = begin + timedelta(days=6)
+            return f"{format_date(begin)}–{format_date(end)}"
+
+        if timeframe == "1mo":
+            year_part, month_part = candle_key_value.split("-", 1)
+            month = int(month_part)
+            month_name = MONTH_NAMES.get(month, f"{month:02d}")
+            return f"{month_name} {int(year_part)}"
+    except (TypeError, ValueError):
+        return candle_key_value
+
+    return candle_key_value
 
 
 def format_date(value: datetime) -> str:

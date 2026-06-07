@@ -35,6 +35,7 @@ class UserSettings:
     auto_notifications_enabled: bool
     last_processed_candle_keys: dict[str, str] = field(default_factory=dict)
     last_sent_candle_keys: dict[str, str] = field(default_factory=dict)
+    last_auto_report_tickers: dict[str, list[str]] = field(default_factory=dict)
     streaks: dict[str, dict[str, int]] = field(default_factory=dict)
     last_reports: dict[str, LastReport] = field(default_factory=dict)
 
@@ -172,24 +173,59 @@ class UserSettingsStore:
         sent: bool = True,
     ) -> UserSettings:
         normalized_timeframe = normalize_supported_timeframe(timeframe)
+        normalized_tickers = normalize_ticker_list(matched_tickers)
         with self._lock:
             raw = self._require_user(user_id)
             last_processed = raw.setdefault("last_processed_candle_keys", {})
             last_processed_candle_key = last_processed.get(normalized_timeframe)
+            last_sent = raw.setdefault("last_sent_candle_keys", {})
+            last_tickers = normalize_auto_report_tickers(
+                raw.setdefault("last_auto_report_tickers", {})
+            )
+            raw["last_auto_report_tickers"] = last_tickers
             if last_processed_candle_key == candle_key:
+                changed = False
+                previous_tickers = last_tickers.get(normalized_timeframe, [])
+                current_tickers = merge_ticker_lists(
+                    previous_tickers,
+                    normalized_tickers,
+                )
+                if current_tickers != previous_tickers:
+                    last_tickers[normalized_timeframe] = current_tickers
+                    streaks = raw.setdefault("streaks", {})
+                    normalized_streaks = normalize_streaks(streaks)
+                    current_streaks = dict(
+                        normalized_streaks.get(normalized_timeframe, {})
+                    )
+                    for ticker in current_tickers:
+                        current_streaks.setdefault(ticker, 1)
+                    normalized_streaks[normalized_timeframe] = {
+                        ticker: current_streaks[ticker]
+                        for ticker in current_tickers
+                        if ticker in current_streaks
+                    }
+                    raw["streaks"] = normalized_streaks
+                    changed = True
+
+                if sent and last_sent.get(normalized_timeframe) != candle_key:
+                    last_sent[normalized_timeframe] = candle_key
+                    changed = True
+
+                if changed:
+                    self._save()
                 return self._to_user_settings(raw)
 
-            last_sent = raw.setdefault("last_sent_candle_keys", {})
             streaks = raw.setdefault("streaks", {})
             current_streaks = normalize_streaks(streaks).get(normalized_timeframe, {})
             streaks[normalized_timeframe] = calculate_streaks_for_new_candle(
                 current_streaks,
-                matched_tickers,
+                normalized_tickers,
                 last_processed_candle_key=last_processed_candle_key,
                 previous_candle_key=previous_candle_key,
             )
             raw["streaks"] = normalize_streaks(streaks)
             last_processed[normalized_timeframe] = candle_key
+            last_tickers[normalized_timeframe] = normalized_tickers
             if sent:
                 last_sent[normalized_timeframe] = candle_key
             self._save()
@@ -264,6 +300,7 @@ class UserSettingsStore:
             ),
             "last_processed_candle_keys": {},
             "last_sent_candle_keys": {},
+            "last_auto_report_tickers": {},
             "streaks": {},
             "last_reports": {},
         }
@@ -333,6 +370,10 @@ class UserSettingsStore:
         for timeframe, candle_key in raw["last_sent_candle_keys"].items():
             raw["last_processed_candle_keys"].setdefault(timeframe, candle_key)
 
+        raw["last_auto_report_tickers"] = normalize_auto_report_tickers(
+            raw.get("last_auto_report_tickers", {})
+        )
+
         raw.pop("auto_daily_report", None)
         raw.pop("auto_weekly_report", None)
         raw.pop("auto_monthly_report", None)
@@ -380,6 +421,9 @@ class UserSettingsStore:
             last_sent_candle_keys=normalize_last_sent_candle_keys(
                 raw.get("last_sent_candle_keys", {})
             ),
+            last_auto_report_tickers=normalize_auto_report_tickers(
+                raw.get("last_auto_report_tickers", {})
+            ),
             streaks=normalize_streaks(raw.get("streaks", {})),
             last_reports=reports,
         )
@@ -425,6 +469,52 @@ def normalize_last_sent_candle_keys(value: Any) -> dict[str, str]:
         if normalized_timeframe not in SUPPORTED_TIMEFRAMES or not candle_time:
             continue
         normalized[normalized_timeframe] = str(candle_time)
+    return normalized
+
+
+def normalize_ticker_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        raw_values = [part.strip() for part in value.split(",")]
+    elif isinstance(value, (list, tuple, set)):
+        raw_values = [str(part).strip() for part in value]
+    else:
+        return []
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for ticker in raw_values:
+        normalized_ticker = ticker.upper()
+        if not normalized_ticker or normalized_ticker in seen:
+            continue
+        normalized.append(normalized_ticker)
+        seen.add(normalized_ticker)
+    return normalized
+
+
+def merge_ticker_lists(*values: Any) -> list[str]:
+    merged: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        for ticker in normalize_ticker_list(value):
+            if ticker in seen:
+                continue
+            merged.append(ticker)
+            seen.add(ticker)
+    return merged
+
+
+def normalize_auto_report_tickers(value: Any) -> dict[str, list[str]]:
+    if not isinstance(value, dict):
+        return {}
+
+    normalized: dict[str, list[str]] = {}
+    for timeframe, tickers in value.items():
+        normalized_timeframe = normalize_timeframe(str(timeframe))
+        if normalized_timeframe not in SUPPORTED_TIMEFRAMES:
+            continue
+        normalized[normalized_timeframe] = normalize_ticker_list(tickers)
     return normalized
 
 

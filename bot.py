@@ -18,6 +18,7 @@ from analytics import (
     build_manual_report,
     build_turnover_report,
     collect_moex_analysis,
+    format_candle_key_period,
 )
 from config import SUPPORTED_TIMEFRAMES, Settings, load_settings
 from keyboards import (
@@ -45,7 +46,7 @@ from keyboards import (
     report_actions_keyboard,
     timeframe_keyboard,
 )
-from scheduler import start_scheduler, stop_scheduler
+from scheduler import get_expected_candle_key, start_scheduler, stop_scheduler
 from user_settings import BASE_NOTIFICATION_TIMEFRAMES, UserSettings, UserSettingsStore
 from utils import (
     enabled_label,
@@ -53,6 +54,7 @@ from utils import (
     split_telegram_message,
     timeframe_list_label,
     timeframe_label,
+    timezone_label,
 )
 
 
@@ -497,6 +499,17 @@ async def send_manual_report(
         text = "В tickers.txt нет тикеров для проверки."
     else:
         text = build_manual_report(result, timezone_name=settings.timezone_name)
+        warning = build_manual_stale_candle_warning(
+            result,
+            expected_candle_key=get_expected_candle_key(
+                user_settings.timeframe,
+                result.updated_at,
+                settings=settings,
+            ),
+            timezone_name=settings.timezone_name,
+        )
+        if warning:
+            text = f"{warning}\n\n{text}"
 
     store.save_last_report(
         user_id=user_settings.user_id,
@@ -507,6 +520,45 @@ async def send_manual_report(
     )
 
     await send_text(update, context, text, reply_markup=report_actions_keyboard())
+
+
+def build_manual_stale_candle_warning(
+    result,
+    *,
+    expected_candle_key: str,
+    timezone_name: str,
+) -> str | None:
+    latest_available_candle_key = result.latest_candle_key
+    if latest_available_candle_key is None:
+        return None
+    if latest_available_candle_key >= expected_candle_key:
+        return None
+
+    suffix = (
+        f" {timezone_label(timezone_name)}"
+        if result.timeframe in {"1m", "10m", "1h"}
+        else ""
+    )
+    title = (
+        "⚠️ MOEX ещё не отдала свежую часовую свечу."
+        if result.timeframe == "1h"
+        else "⚠️ MOEX ещё не отдала свежую свечу."
+    )
+    return "\n".join(
+        [
+            title,
+            (
+                "Ожидалась свеча: "
+                f"{format_candle_key_period(expected_candle_key, result.timeframe)}{suffix}"
+            ),
+            (
+                "Последняя доступная свеча: "
+                f"{format_candle_key_period(latest_available_candle_key, result.timeframe)}{suffix}"
+            ),
+            "",
+            "Показан последний доступный отчёт.",
+        ]
+    )
 
 
 async def send_last_report(

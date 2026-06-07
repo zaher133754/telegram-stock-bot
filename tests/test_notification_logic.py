@@ -11,9 +11,11 @@ from analytics import (
     build_auto_notification_report,
     build_empty_auto_notification_report,
     build_manual_report,
+    compare_last_two_candles,
     format_failures,
     format_period,
 )
+from bot import build_manual_stale_candle_warning
 from moex_client import Candle, MoexClient, candle_key
 from user_settings import UserSettingsStore
 
@@ -273,6 +275,55 @@ class AnalysisReportTests(unittest.TestCase):
         self.assertNotIn("(X2)", manual_report)
         self.assertIn("Период последней закрытой свечи: 16:10–16:19 МСК", auto_report)
 
+    def test_breakout_percent_uses_previous_high_in_all_reports(self) -> None:
+        previous = candle("SBER", moscow_datetime(2026, 6, 4, 16, 0), high=100, close=80)
+        latest = candle("SBER", moscow_datetime(2026, 6, 4, 16, 10), close=101)
+        comparison = compare_last_two_candles([previous, latest])
+        result = AnalysisResult(
+            timeframe="10m",
+            comparisons=[comparison],
+            failures=[],
+            updated_at=moscow_datetime(2026, 6, 4, 16, 21),
+            tickers_count=1,
+        )
+
+        self.assertEqual(comparison.percent_change, 1)
+        self.assertIn(
+            "Пробой high: +1.00%",
+            build_manual_report(result, timezone_name="Europe/Moscow"),
+        )
+        self.assertIn(
+            "Пробой high: +1.00%",
+            build_auto_notification_report(
+                result,
+                timezone_name="Europe/Moscow",
+                streaks={"SBER": 1},
+            ),
+        )
+
+    def test_manual_warning_is_shown_when_expected_hour_is_missing(self) -> None:
+        previous = candle("SBER", moscow_datetime(2026, 6, 4, 16, 0), high=100, close=99)
+        latest = candle("SBER", moscow_datetime(2026, 6, 4, 17, 0), close=101)
+        result = AnalysisResult(
+            timeframe="1h",
+            comparisons=[compare_last_two_candles([previous, latest])],
+            failures=[],
+            updated_at=moscow_datetime(2026, 6, 4, 19, 1),
+            tickers_count=1,
+        )
+
+        warning = build_manual_stale_candle_warning(
+            result,
+            expected_candle_key="2026-06-04 18:00",
+            timezone_name="Europe/Moscow",
+        )
+
+        self.assertIsNotNone(warning)
+        self.assertIn("MOEX ещё не отдала свежую часовую свечу.", warning)
+        self.assertIn("Ожидалась свеча: 18:00–18:59 МСК", warning)
+        self.assertIn("Последняя доступная свеча: 17:00–17:59 МСК", warning)
+        self.assertIn("Показан последний доступный отчёт.", warning)
+
     def test_failure_message_does_not_expose_technical_errors(self) -> None:
         lines = format_failures(
             [
@@ -425,6 +476,7 @@ class UserSettingsTests(unittest.TestCase):
         saved_user = store._data["users"]["1"]
         self.assertIn("last_processed_candle_keys", saved_user)
         self.assertIn("last_sent_candle_keys", saved_user)
+        self.assertIn("last_auto_report_tickers", saved_user)
         self.assertNotIn("last_sent_candle_times", saved_user)
 
     def test_streak_restarts_when_a_candle_was_skipped(self) -> None:
@@ -494,6 +546,29 @@ class UserSettingsTests(unittest.TestCase):
             {"10m": "2026-06-04 12:00"},
         )
         self.assertEqual(user.last_sent_candle_keys, {})
+        self.assertEqual(user.last_auto_report_tickers, {"10m": []})
+
+    def test_same_candle_updates_saved_auto_report_tickers(self) -> None:
+        store = MemoryUserSettingsStore(TESTS_DIR / "unused-same-candle-settings.json")
+        store.ensure_user(chat_id=1, user_id=1)
+        store.record_auto_result(
+            user_id=1,
+            timeframe="1h",
+            candle_key="2026-06-04 12:00",
+            previous_candle_key="2026-06-04 11:00",
+            matched_tickers=["SBER"],
+        )
+
+        user = store.record_auto_result(
+            user_id=1,
+            timeframe="1h",
+            candle_key="2026-06-04 12:00",
+            previous_candle_key="2026-06-04 11:00",
+            matched_tickers=["SBER", "LKOH"],
+        )
+
+        self.assertEqual(user.last_auto_report_tickers["1h"], ["SBER", "LKOH"])
+        self.assertEqual(user.streaks["1h"], {"SBER": 1, "LKOH": 1})
 
 
 if __name__ == "__main__":

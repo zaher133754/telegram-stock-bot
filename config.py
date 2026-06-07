@@ -46,6 +46,9 @@ class Settings:
     scheduler_interval_seconds: int
     moex_request_retries: int = 3
     intraday_check_delay_seconds: int = 30
+    one_minute_check_interval_seconds: int = 180
+    hourly_confirmation_delay_minutes: int = 5
+    hourly_check_window_minutes: int = 20
     daily_report_time: time = time(23, 55)
     weekly_report_day: int = WEEKDAY_NAMES["FRIDAY"]
     weekly_report_time: time = time(23, 55)
@@ -192,6 +195,22 @@ def load_settings() -> Settings:
     if intraday_check_delay_seconds >= 600:
         raise ValueError("INTRADAY_CHECK_DELAY_SECONDS must be less than 600")
 
+    one_minute_check_interval_seconds = _int_from_env(
+        "ONE_MINUTE_CHECK_INTERVAL_SECONDS",
+        180,
+    )
+
+    hourly_confirmation_delay_minutes = _non_negative_int_from_env(
+        "HOURLY_CONFIRMATION_DELAY_MINUTES",
+        5,
+    )
+    if hourly_confirmation_delay_minutes > 10:
+        raise ValueError("HOURLY_CONFIRMATION_DELAY_MINUTES must be 10 or less")
+
+    hourly_check_window_minutes = _int_from_env("HOURLY_CHECK_WINDOW_MINUTES", 20)
+    if hourly_check_window_minutes > 59:
+        raise ValueError("HOURLY_CHECK_WINDOW_MINUTES must be less than 60")
+
     return Settings(
         telegram_bot_token=token,
         telegram_chat_id=_optional_int("TELEGRAM_CHAT_ID"),
@@ -223,6 +242,9 @@ def load_settings() -> Settings:
             60,
         ),
         intraday_check_delay_seconds=intraday_check_delay_seconds,
+        one_minute_check_interval_seconds=one_minute_check_interval_seconds,
+        hourly_confirmation_delay_minutes=hourly_confirmation_delay_minutes,
+        hourly_check_window_minutes=hourly_check_window_minutes,
         daily_report_time=_time_from_env("DAILY_REPORT_TIME", "23:55"),
         weekly_report_day=_weekday_from_env("WEEKLY_REPORT_DAY", "FRIDAY"),
         weekly_report_time=_time_from_env("WEEKLY_REPORT_TIME", "23:55"),
