@@ -18,6 +18,7 @@ from analytics import (
     collect_moex_analysis,
 )
 from config import SUPPORTED_TIMEFRAMES, Settings
+from instruments import get_available_tickers
 from keyboards import report_actions_keyboard
 from moex_client import candle_key
 from user_settings import (
@@ -37,6 +38,7 @@ AUTO_HOURLY_FIRST_SEEN_KEY = "auto_hourly_first_seen"
 AUTO_ONE_MINUTE_LAST_CHECK_KEY = "auto_one_minute_last_check"
 AUTO_TIMEFRAME_PRIORITY = ("1h", "10m", "1m", "1d", "1w", "1mo")
 EMPTY_REPORT_TIMEFRAMES = frozenset({"1h", "1d", "1w", "1mo"})
+DAILY_EMPTY_REPORT_TEXT = "По дневному таймфрейму сигналов нет"
 DEFAULT_REPORT_TIME = datetime(2000, 1, 1, 23, 55).time()
 
 
@@ -292,8 +294,29 @@ async def check_timeframe_notifications(
                 logger.info("Skipping timeframe: 1h, reason: %s", pending_reason)
                 return
 
+        analysis_groups = build_selected_ticker_groups(
+            store=store,
+            users=users,
+            settings=settings,
+            timeframe=timeframe,
+        )
+        active_users = [
+            user
+            for selected_tickers, group_users in analysis_groups
+            if selected_tickers is not None
+            for user in group_users
+        ]
+
+        if users and not active_users:
+            logger.info(
+                "Auto notification skipped: timeframe=%s no users with selected tickers",
+                timeframe,
+            )
+            return
+
+        processed_check_users = active_users if users else users
         if timeframe in {"1m", "10m"} and all_users_processed_candle(
-            users,
+            processed_check_users,
             timeframe=timeframe,
             candle_key=expected_candle_key,
         ):
@@ -304,36 +327,102 @@ async def check_timeframe_notifications(
             )
             return
 
-        result = await asyncio.to_thread(collect_moex_analysis, settings, timeframe)
-        requests_count = result.moex_requests_count
+        for selected_tickers, group_users in analysis_groups:
+            logger.info(
+                "Auto notification selected tickers: timeframe=%s users=%s tickers=%s",
+                timeframe,
+                len(group_users),
+                len(selected_tickers) if selected_tickers is not None else "default",
+            )
+            result = await asyncio.to_thread(
+                collect_moex_analysis,
+                settings,
+                timeframe,
+                selected_tickers,
+            )
+            requests_count += result.moex_requests_count
 
-        latest_available_candle_key = result.latest_candle_key
-        if latest_available_candle_key is None:
-            logger.info("No closed candle data for auto notification %s", timeframe)
+            latest_available_candle_key = result.latest_candle_key
+            if latest_available_candle_key is None:
+                logger.info("No closed candle data for auto notification %s", timeframe)
+                if timeframe == "1h":
+                    log_hourly_auto_debug(
+                        now_msk=current_time,
+                        expected_candle_key=expected_candle_key,
+                        latest_available_candle_key=None,
+                        result=result,
+                        sent=False,
+                        reason="no closed candle data",
+                    )
+                continue
+
             if timeframe == "1h":
+                logger.info(
+                    "1h notification data ready: candle_key=%s matched_tickers=%s",
+                    latest_available_candle_key,
+                    len(result.matched_items),
+                )
+
+            if timeframe != "1d" and latest_available_candle_key < expected_candle_key:
+                logger.info(
+                    "Expected %s candle %s is not available yet. Latest available: %s",
+                    timeframe,
+                    short_candle_key_for_log(expected_candle_key, timeframe),
+                    short_candle_key_for_log(latest_available_candle_key, timeframe),
+                )
+                if timeframe == "1h":
+                    log_hourly_auto_debug(
+                        now_msk=current_time,
+                        expected_candle_key=expected_candle_key,
+                        latest_available_candle_key=latest_available_candle_key,
+                        result=result,
+                        sent=False,
+                        reason="expected candle not available yet",
+                    )
+                continue
+
+            if timeframe != "1d" and latest_available_candle_key > expected_candle_key:
+                logger.warning(
+                    "Latest available %s candle %s is newer than expected %s. "
+                    "Auto notification skipped.",
+                    timeframe,
+                    latest_available_candle_key,
+                    expected_candle_key,
+                )
+                if timeframe == "1h":
+                    log_hourly_auto_debug(
+                        now_msk=current_time,
+                        expected_candle_key=expected_candle_key,
+                        latest_available_candle_key=latest_available_candle_key,
+                        result=result,
+                        sent=False,
+                        reason="latest available candle is newer than expected",
+                    )
+                continue
+
+            if timeframe == "1h" and not mark_hourly_candle_seen_or_ready(
+                application,
+                candle_key_value=latest_available_candle_key,
+                now=current_time,
+                settings=settings,
+            ):
                 log_hourly_auto_debug(
                     now_msk=current_time,
                     expected_candle_key=expected_candle_key,
-                    latest_available_candle_key=None,
+                    latest_available_candle_key=latest_available_candle_key,
                     result=result,
                     sent=False,
-                    reason="no closed candle data",
+                    reason="hourly confirmation delay is not elapsed",
                 )
-            return
+                continue
 
-        if timeframe == "1h":
-            logger.info(
-                "1h notification data ready: candle_key=%s matched_tickers=%s",
-                latest_available_candle_key,
-                len(result.matched_items),
-            )
-
-        if latest_available_candle_key < expected_candle_key:
-            logger.info(
-                "Expected %s candle %s is not available yet. Latest available: %s",
-                timeframe,
-                short_candle_key_for_log(expected_candle_key, timeframe),
-                short_candle_key_for_log(latest_available_candle_key, timeframe),
+            sent = await process_timeframe_notifications(
+                application=application,
+                store=store,
+                settings=settings,
+                timeframe=timeframe,
+                users=group_users,
+                result=result,
             )
             if timeframe == "1h":
                 log_hourly_auto_debug(
@@ -341,63 +430,9 @@ async def check_timeframe_notifications(
                     expected_candle_key=expected_candle_key,
                     latest_available_candle_key=latest_available_candle_key,
                     result=result,
-                    sent=False,
-                    reason="expected candle not available yet",
+                    sent=sent,
+                    reason=None if sent else "no message sent",
                 )
-            return
-
-        if latest_available_candle_key > expected_candle_key:
-            logger.warning(
-                "Latest available %s candle %s is newer than expected %s. "
-                "Auto notification skipped.",
-                timeframe,
-                latest_available_candle_key,
-                expected_candle_key,
-            )
-            if timeframe == "1h":
-                log_hourly_auto_debug(
-                    now_msk=current_time,
-                    expected_candle_key=expected_candle_key,
-                    latest_available_candle_key=latest_available_candle_key,
-                    result=result,
-                    sent=False,
-                    reason="latest available candle is newer than expected",
-                )
-            return
-
-        if timeframe == "1h" and not mark_hourly_candle_seen_or_ready(
-            application,
-            candle_key_value=latest_available_candle_key,
-            now=current_time,
-            settings=settings,
-        ):
-            log_hourly_auto_debug(
-                now_msk=current_time,
-                expected_candle_key=expected_candle_key,
-                latest_available_candle_key=latest_available_candle_key,
-                result=result,
-                sent=False,
-                reason="hourly confirmation delay is not elapsed",
-            )
-            return
-
-        sent = await process_timeframe_notifications(
-            application=application,
-            store=store,
-            settings=settings,
-            timeframe=timeframe,
-            users=users,
-            result=result,
-        )
-        if timeframe == "1h":
-            log_hourly_auto_debug(
-                now_msk=current_time,
-                expected_candle_key=expected_candle_key,
-                latest_available_candle_key=latest_available_candle_key,
-                result=result,
-                sent=sent,
-                reason=None if sent else "no message sent",
-            )
     except FileNotFoundError:
         logger.exception("Tickers file was not found")
     except Exception:
@@ -409,6 +444,36 @@ async def check_timeframe_notifications(
             time.perf_counter() - started_at,
             requests_count,
         )
+
+
+def build_selected_ticker_groups(
+    *,
+    store: UserSettingsStore,
+    users: list[UserSettings],
+    settings: Settings,
+    timeframe: str,
+) -> list[tuple[list[str] | None, list[UserSettings]]]:
+    if not users:
+        return [(None, users)]
+
+    all_tickers = get_available_tickers(settings.tickers_file, allow_missing=True)
+    grouped_users: dict[tuple[str, ...], list[UserSettings]] = defaultdict(list)
+    for user in users:
+        current_user = store.ensure_selected_tickers(user.user_id, all_tickers)
+        selected_tickers = current_user.selected_tickers
+        if not selected_tickers:
+            logger.info(
+                "Auto notification user skipped: user_id=%s timeframe=%s selected_tickers=0",
+                current_user.user_id,
+                timeframe,
+            )
+            continue
+        grouped_users[tuple(selected_tickers)].append(current_user)
+
+    return [
+        (list(selected_tickers), group_users)
+        for selected_tickers, group_users in grouped_users.items()
+    ]
 
 
 def should_check_timeframe(
@@ -472,13 +537,7 @@ def timeframe_skip_reason(
         return f"not within first {window_minutes} minutes after hour boundary"
 
     if timeframe == "1d":
-        if _is_in_scheduled_time_window(
-            current_time,
-            config.daily_report_time,
-            interval_seconds,
-        ):
-            return None
-        return "not daily report time"
+        return None
 
     if timeframe == "1w":
         if current_time.weekday() != config.weekly_report_day:
@@ -746,15 +805,18 @@ async def process_timeframe_notifications(
             continue
 
         if not matched_tickers:
-            send_empty_report = (
+            send_empty_report = timeframe == "1d" or (
                 settings.send_empty_reports_for_higher_timeframes
                 and timeframe in EMPTY_REPORT_TIMEFRAMES
             )
             if send_empty_report:
-                text = build_empty_auto_notification_report(
-                    result,
-                    timezone_name=settings.timezone_name,
-                )
+                if timeframe == "1d":
+                    text = DAILY_EMPTY_REPORT_TEXT
+                else:
+                    text = build_empty_auto_notification_report(
+                        result,
+                        timezone_name=settings.timezone_name,
+                    )
                 try:
                     await send_scheduled_report(
                         application=application,

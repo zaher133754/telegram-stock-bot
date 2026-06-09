@@ -33,6 +33,7 @@ class UserSettings:
     selected_timeframe: str
     notification_timeframes: list[str]
     auto_notifications_enabled: bool
+    selected_tickers: list[str] = field(default_factory=list)
     last_processed_candle_keys: dict[str, str] = field(default_factory=dict)
     last_sent_candle_keys: dict[str, str] = field(default_factory=dict)
     last_auto_report_tickers: dict[str, list[str]] = field(default_factory=dict)
@@ -96,7 +97,13 @@ class UserSettingsStore:
             self._save()
             return result
 
-    def reset_user(self, *, user_id: int, chat_id: int) -> UserSettings:
+    def reset_user(
+        self,
+        *,
+        user_id: int,
+        chat_id: int,
+        all_tickers: list[str] | tuple[str, ...] | None = None,
+    ) -> UserSettings:
         with self._lock:
             self._users()[str(user_id)] = self._default_user(
                 chat_id=chat_id,
@@ -104,6 +111,7 @@ class UserSettingsStore:
                 timeframe="1d",
                 notification_timeframes=BASE_NOTIFICATION_TIMEFRAMES,
                 auto_notifications_enabled=True,
+                selected_tickers=all_tickers,
             )
             self._save()
             return self._to_user_settings(self._users()[str(user_id)])
@@ -140,6 +148,70 @@ class UserSettingsStore:
                 raw.get("auto_notifications_enabled", True)
             )
             self._save()
+            return self._to_user_settings(raw)
+
+    def get_selected_tickers(self, user_id: int) -> list[str]:
+        with self._lock:
+            raw = self._require_user(user_id)
+            return normalize_ticker_list(raw.get("selected_tickers", []))
+
+    def set_selected_tickers(self, user_id: int, tickers: Any) -> UserSettings:
+        with self._lock:
+            raw = self._require_user(user_id)
+            raw["selected_tickers"] = normalize_ticker_list(tickers)
+            self._save()
+            return self._to_user_settings(raw)
+
+    def toggle_selected_ticker(
+        self,
+        user_id: int,
+        ticker: str,
+        all_tickers: Any,
+    ) -> UserSettings:
+        available_tickers = normalize_ticker_list(all_tickers)
+        normalized_ticker = normalize_ticker_list([ticker])
+        if not normalized_ticker:
+            return self.get_user(user_id) or self._missing_user(user_id)
+
+        ticker_name = normalized_ticker[0]
+        if available_tickers and ticker_name not in set(available_tickers):
+            return self.get_user(user_id) or self._missing_user(user_id)
+
+        with self._lock:
+            raw = self._require_user(user_id)
+            self._ensure_selected_tickers_raw(raw, available_tickers)
+            selected = set(normalize_ticker_list(raw.get("selected_tickers", [])))
+            if ticker_name in selected:
+                selected.remove(ticker_name)
+            else:
+                selected.add(ticker_name)
+            raw["selected_tickers"] = order_tickers(selected, available_tickers)
+            self._save()
+            return self._to_user_settings(raw)
+
+    def select_all_tickers(self, user_id: int, all_tickers: Any) -> UserSettings:
+        with self._lock:
+            raw = self._require_user(user_id)
+            raw["selected_tickers"] = normalize_ticker_list(all_tickers)
+            self._save()
+            return self._to_user_settings(raw)
+
+    def clear_selected_tickers(self, user_id: int) -> UserSettings:
+        with self._lock:
+            raw = self._require_user(user_id)
+            raw["selected_tickers"] = []
+            self._save()
+            return self._to_user_settings(raw)
+
+    def ensure_selected_tickers(self, user_id: int, all_tickers: Any) -> UserSettings:
+        with self._lock:
+            raw = self._require_user(user_id)
+            changed = self._ensure_selected_tickers_raw(
+                raw,
+                normalize_ticker_list(all_tickers),
+            )
+            if changed:
+                self._save()
             return self._to_user_settings(raw)
 
     def save_last_report(
@@ -283,8 +355,9 @@ class UserSettingsStore:
         timeframe: str | None = None,
         notification_timeframes: list[str] | tuple[str, ...] | None = None,
         auto_notifications_enabled: bool | None = None,
+        selected_tickers: Any = None,
     ) -> dict[str, Any]:
-        return {
+        user = {
             "chat_id": chat_id,
             "user_id": user_id,
             "selected_timeframe": normalize_supported_timeframe(
@@ -304,6 +377,9 @@ class UserSettingsStore:
             "streaks": {},
             "last_reports": {},
         }
+        if selected_tickers is not None:
+            user["selected_tickers"] = normalize_ticker_list(selected_tickers)
+        return user
 
     def _fill_missing_user_fields(self, raw: dict[str, Any]) -> None:
         old_timeframe = raw.pop("timeframe", None)
@@ -382,6 +458,8 @@ class UserSettingsStore:
         raw.pop("last_sent_monthly_candle", None)
 
         raw["streaks"] = normalize_streaks(raw.get("streaks", {}))
+        if "selected_tickers" in raw:
+            raw["selected_tickers"] = normalize_ticker_list(raw.get("selected_tickers"))
         raw.setdefault("last_reports", {})
         raw["last_reports"] = migrate_last_reports(raw["last_reports"])
 
@@ -391,6 +469,29 @@ class UserSettingsStore:
             raise KeyError(f"User settings not found for user_id={user_id}")
         self._fill_missing_user_fields(raw)
         return raw
+
+    @staticmethod
+    def _missing_user(user_id: int) -> UserSettings:
+        raise KeyError(f"User settings not found for user_id={user_id}")
+
+    @staticmethod
+    def _ensure_selected_tickers_raw(
+        raw: dict[str, Any],
+        all_tickers: list[str],
+    ) -> bool:
+        if "selected_tickers" not in raw:
+            if not all_tickers:
+                return False
+            raw["selected_tickers"] = list(all_tickers)
+            return True
+
+        selected_tickers = normalize_ticker_list(raw.get("selected_tickers"))
+        if all_tickers:
+            selected_tickers = order_tickers(selected_tickers, all_tickers)
+        if selected_tickers != raw.get("selected_tickers"):
+            raw["selected_tickers"] = selected_tickers
+            return True
+        return False
 
     @staticmethod
     def _to_user_settings(raw: dict[str, Any]) -> UserSettings:
@@ -415,6 +516,7 @@ class UserSettingsStore:
                 raw.get("notification_timeframes", [])
             ),
             auto_notifications_enabled=bool(raw["auto_notifications_enabled"]),
+            selected_tickers=normalize_ticker_list(raw.get("selected_tickers", [])),
             last_processed_candle_keys=normalize_last_sent_candle_keys(
                 raw.get("last_processed_candle_keys", {})
             ),
@@ -503,6 +605,21 @@ def merge_ticker_lists(*values: Any) -> list[str]:
             merged.append(ticker)
             seen.add(ticker)
     return merged
+
+
+def order_tickers(selected_tickers: Any, all_tickers: Any) -> list[str]:
+    selected = set(normalize_ticker_list(selected_tickers))
+    ordered = [
+        ticker
+        for ticker in normalize_ticker_list(all_tickers)
+        if ticker in selected
+    ]
+    extras = [
+        ticker
+        for ticker in normalize_ticker_list(selected_tickers)
+        if ticker not in set(ordered)
+    ]
+    return [*ordered, *extras]
 
 
 def normalize_auto_report_tickers(value: Any) -> dict[str, list[str]]:

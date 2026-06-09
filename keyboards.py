@@ -16,7 +16,12 @@ CALLBACK_NOTIFICATION_TIMEFRAME_MENU = "notify:timeframe_menu"
 CALLBACK_TOGGLE_NOTIFICATIONS = "notify:toggle"
 CALLBACK_LAST_REPORT = "menu:last_report"
 CALLBACK_VOLUMES = "menu:volumes"
-CALLBACK_TICKERS = "menu:tickers"
+CALLBACK_TICKERS = "tickers_menu"
+CALLBACK_TICKERS_PAGE_PREFIX = "tickers_page:"
+CALLBACK_TICKER_TOGGLE_PREFIX = "ticker_toggle:"
+CALLBACK_TICKERS_ALL = "tickers_all"
+CALLBACK_TICKERS_NONE = "tickers_none"
+CALLBACK_TICKERS_SAVE = "tickers_save"
 CALLBACK_SETTINGS = "menu:settings"
 CALLBACK_HELP = "menu:help"
 CALLBACK_TIMEFRAME_PREFIX = "tf:"
@@ -24,6 +29,7 @@ CALLBACK_NOTIFICATION_TIMEFRAME_PREFIX = "notify_tf:"
 
 LEGACY_CALLBACK_ALIASES = {
     "menu:main": MAIN_MENU,
+    "menu:tickers": CALLBACK_TICKERS,
     "report:check": REFRESH,
     "menu:timeframe": TIMEFRAME_MENU,
 }
@@ -34,6 +40,10 @@ def normalize_callback_data(data: str) -> str:
 
 
 def main_menu_keyboard() -> InlineKeyboardMarkup:
+    return build_main_menu_keyboard()
+
+
+def build_main_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
@@ -58,6 +68,57 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
             ],
         ]
     )
+
+
+def build_tickers_keyboard(
+    selected_tickers: list[str] | tuple[str, ...],
+    all_tickers: list[str] | tuple[str, ...],
+    page: int = 0,
+    page_size: int = 20,
+) -> InlineKeyboardMarkup:
+    page_size = max(1, page_size)
+    tickers = [str(ticker).strip().upper() for ticker in all_tickers if str(ticker).strip()]
+    selected = {str(ticker).strip().upper() for ticker in selected_tickers}
+    total_pages = max(1, (len(tickers) + page_size - 1) // page_size)
+    page = max(0, min(page, total_pages - 1))
+    page_tickers = tickers[page * page_size : (page + 1) * page_size]
+
+    rows: list[list[InlineKeyboardButton]] = []
+    for index in range(0, len(page_tickers), 2):
+        row: list[InlineKeyboardButton] = []
+        for ticker in page_tickers[index : index + 2]:
+            prefix = "✅" if ticker in selected else "❌"
+            row.append(
+                InlineKeyboardButton(
+                    f"{prefix} {ticker}",
+                    callback_data=f"{CALLBACK_TICKER_TOGGLE_PREFIX}{ticker}",
+                )
+            )
+        rows.append(row)
+
+    previous_page = max(0, page - 1)
+    next_page = min(total_pages - 1, page + 1)
+    rows.extend(
+        [
+            [
+                InlineKeyboardButton(
+                    "⬅️ Назад",
+                    callback_data=f"{CALLBACK_TICKERS_PAGE_PREFIX}{previous_page}",
+                ),
+                InlineKeyboardButton(
+                    "➡️ Далее",
+                    callback_data=f"{CALLBACK_TICKERS_PAGE_PREFIX}{next_page}",
+                ),
+            ],
+            [
+                InlineKeyboardButton("✅ Выбрать все", callback_data=CALLBACK_TICKERS_ALL),
+                InlineKeyboardButton("Снять все", callback_data=CALLBACK_TICKERS_NONE),
+            ],
+            [InlineKeyboardButton("Сохранить", callback_data=CALLBACK_TICKERS_SAVE)],
+            [InlineKeyboardButton("Главное меню", callback_data=MAIN_MENU)],
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
 
 
 def timeframe_keyboard() -> InlineKeyboardMarkup:

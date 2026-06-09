@@ -479,6 +479,62 @@ class UserSettingsTests(unittest.TestCase):
         self.assertIn("last_auto_report_tickers", saved_user)
         self.assertNotIn("last_sent_candle_times", saved_user)
 
+    def test_selected_tickers_are_created_and_toggled(self) -> None:
+        store = MemoryUserSettingsStore(TESTS_DIR / "unused-selected-tickers.json")
+        store.ensure_user(chat_id=1, user_id=1)
+
+        user = store.ensure_selected_tickers(1, ["SBER", "GAZP", "LKOH"])
+        self.assertEqual(user.selected_tickers, ["SBER", "GAZP", "LKOH"])
+
+        user = store.toggle_selected_ticker(1, "GAZP", ["SBER", "GAZP", "LKOH"])
+        self.assertEqual(user.selected_tickers, ["SBER", "LKOH"])
+
+        user = store.toggle_selected_ticker(1, "GAZP", ["SBER", "GAZP", "LKOH"])
+        self.assertEqual(user.selected_tickers, ["SBER", "GAZP", "LKOH"])
+
+        user = store.clear_selected_tickers(1)
+        self.assertEqual(user.selected_tickers, [])
+
+        user = store.select_all_tickers(1, ["SBER", "GAZP"])
+        self.assertEqual(user.selected_tickers, ["SBER", "GAZP"])
+
+    def test_legacy_user_gets_all_selected_tickers_on_ensure(self) -> None:
+        store = MemoryUserSettingsStore(TESTS_DIR / "unused-legacy-selected.json")
+        store._data["users"]["1"] = {
+            "chat_id": 1,
+            "user_id": 1,
+            "selected_timeframe": "1d",
+            "notification_timeframes": ["1d"],
+            "auto_notifications_enabled": True,
+            "last_reports": {},
+        }
+
+        user = store.ensure_selected_tickers(1, ["SBER", "GAZP"])
+
+        self.assertEqual(user.selected_tickers, ["SBER", "GAZP"])
+        self.assertEqual(
+            store._data["users"]["1"]["selected_tickers"],
+            ["SBER", "GAZP"],
+        )
+
+    def test_reset_user_selects_all_tickers_and_clears_state(self) -> None:
+        store = MemoryUserSettingsStore(TESTS_DIR / "unused-reset-selected.json")
+        store.ensure_user(chat_id=1, user_id=1)
+        store.ensure_selected_tickers(1, ["SBER", "GAZP"])
+        store.record_auto_result(
+            user_id=1,
+            timeframe="1d",
+            candle_key="2026-06-04",
+            previous_candle_key="2026-06-03",
+            matched_tickers=["SBER"],
+        )
+
+        user = store.reset_user(user_id=1, chat_id=1, all_tickers=["LKOH", "ROSN"])
+
+        self.assertEqual(user.selected_tickers, ["LKOH", "ROSN"])
+        self.assertEqual(user.streaks, {})
+        self.assertEqual(user.last_processed_candle_keys, {})
+
     def test_streak_restarts_when_a_candle_was_skipped(self) -> None:
         store = MemoryUserSettingsStore(TESTS_DIR / "unused-settings.json")
         store.ensure_user(chat_id=1, user_id=1)

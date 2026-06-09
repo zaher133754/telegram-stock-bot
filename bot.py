@@ -21,6 +21,7 @@ from analytics import (
     format_candle_key_period,
 )
 from config import SUPPORTED_TIMEFRAMES, Settings, load_settings
+from instruments import get_available_tickers
 from keyboards import (
     CALLBACK_HELP,
     CALLBACK_LAST_REPORT,
@@ -30,7 +31,12 @@ from keyboards import (
     CALLBACK_RESTART,
     CALLBACK_SETTINGS,
     CALLBACK_START_PANEL,
+    CALLBACK_TICKER_TOGGLE_PREFIX,
     CALLBACK_TICKERS,
+    CALLBACK_TICKERS_ALL,
+    CALLBACK_TICKERS_NONE,
+    CALLBACK_TICKERS_PAGE_PREFIX,
+    CALLBACK_TICKERS_SAVE,
     CALLBACK_TIMEFRAME_PREFIX,
     CALLBACK_TOGGLE_NOTIFICATIONS,
     CALLBACK_VOLUMES,
@@ -38,6 +44,7 @@ from keyboards import (
     REFRESH,
     TIMEFRAME_MENU,
     after_timeframe_keyboard,
+    build_tickers_keyboard,
     main_menu_keyboard,
     main_menu_only_keyboard,
     notification_timeframe_keyboard,
@@ -50,7 +57,6 @@ from scheduler import get_expected_candle_key, start_scheduler, stop_scheduler
 from user_settings import BASE_NOTIFICATION_TIMEFRAMES, UserSettings, UserSettingsStore
 from utils import (
     enabled_label,
-    load_tickers,
     split_telegram_message,
     timeframe_list_label,
     timeframe_label,
@@ -64,6 +70,11 @@ TELEGRAM_CONNECTION_POOL_SIZE = 32
 TELEGRAM_GET_UPDATES_POOL_SIZE = 2
 TELEGRAM_POOL_TIMEOUT_SECONDS = 5
 TELEGRAM_CONCURRENT_UPDATES = 16
+TICKERS_PAGE_SIZE = 20
+TICKERS_MENU_PAGE_STATE_KEY = "tickers_menu_pages"
+EMPTY_SELECTED_TICKERS_TEXT = (
+    "У вас не выбрано ни одного тикера. Откройте Мои тикеры и выберите акции для отслеживания."
+)
 
 AUTO_CANDLE_PHRASES = {
     "1m": "минутной",
@@ -117,6 +128,15 @@ def get_user_settings_store(context: ContextTypes.DEFAULT_TYPE) -> UserSettingsS
     return context.application.bot_data["user_settings_store"]
 
 
+def get_all_tickers(context: ContextTypes.DEFAULT_TYPE, *, allow_missing: bool = True) -> list[str]:
+    settings = get_settings(context)
+    try:
+        return get_available_tickers(settings.tickers_file, allow_missing=allow_missing)
+    except FileNotFoundError:
+        logger.exception("Tickers file was not found")
+        return []
+
+
 def is_user_allowed(update: Update, settings: Settings) -> bool:
     if settings.allowed_user_id is None:
         return True
@@ -143,7 +163,8 @@ def ensure_user_settings(
     if chat is None or user is None:
         raise RuntimeError("Cannot resolve chat_id or user_id from Telegram update")
     store = get_user_settings_store(context)
-    return store.ensure_user(chat_id=chat.id, user_id=user.id)
+    store.ensure_user(chat_id=chat.id, user_id=user.id)
+    return store.ensure_selected_tickers(user.id, get_all_tickers(context))
 
 
 async def send_text(
@@ -260,7 +281,21 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     elif data == CALLBACK_VOLUMES:
         await send_turnover_report(update, context, user_settings=user_settings)
     elif data == CALLBACK_TICKERS:
-        await send_tickers(update, context)
+        await send_tickers_menu(update, context, page=0)
+    elif data.startswith(CALLBACK_TICKERS_PAGE_PREFIX):
+        await send_tickers_menu(
+            update,
+            context,
+            page=parse_tickers_page(data),
+        )
+    elif data.startswith(CALLBACK_TICKER_TOGGLE_PREFIX):
+        await toggle_ticker_selection(update, context, data)
+    elif data == CALLBACK_TICKERS_ALL:
+        await select_all_tickers(update, context)
+    elif data == CALLBACK_TICKERS_NONE:
+        await clear_ticker_selection(update, context)
+    elif data == CALLBACK_TICKERS_SAVE:
+        await save_ticker_selection(update, context)
     elif data == CALLBACK_SETTINGS:
         await send_settings(update, context, user_settings=user_settings)
     elif data == CALLBACK_HELP:
@@ -318,7 +353,17 @@ async def restart_user_settings(
     if chat is None or user is None:
         return
 
-    user_settings = store.reset_user(user_id=user.id, chat_id=chat.id)
+    all_tickers = get_all_tickers(context)
+    user_settings = store.reset_user(
+        user_id=user.id,
+        chat_id=chat.id,
+        all_tickers=all_tickers,
+    )
+    logger.info(
+        "User settings restarted: user_id=%s selected_tickers=%s",
+        user.id,
+        len(user_settings.selected_tickers),
+    )
     text = (
         "✅ Настройки сброшены. История диалога сохранена.\n\n"
         f"Таймфрейм ручной проверки: {timeframe_label(user_settings.timeframe)}\n"
@@ -468,6 +513,29 @@ async def send_manual_report(
 ) -> None:
     settings = get_settings(context)
     store = get_user_settings_store(context)
+    user_settings = store.ensure_selected_tickers(
+        user_settings.user_id,
+        get_all_tickers(context),
+    )
+    selected_tickers = user_settings.selected_tickers
+    if not selected_tickers:
+        logger.info(
+            "Manual report skipped: user_id=%s selected_tickers=0",
+            user_settings.user_id,
+        )
+        await send_text(
+            update,
+            context,
+            EMPTY_SELECTED_TICKERS_TEXT,
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    logger.info(
+        "Manual report selected tickers: user_id=%s count=%s",
+        user_settings.user_id,
+        len(selected_tickers),
+    )
     await send_text(update, context, "Готовлю отчёт по закрытым свечам...")
 
     try:
@@ -475,6 +543,7 @@ async def send_manual_report(
             collect_moex_analysis,
             settings,
             user_settings.timeframe,
+            selected_tickers,
         )
     except FileNotFoundError:
         logger.exception("Tickers file was not found")
@@ -588,6 +657,30 @@ async def send_turnover_report(
     user_settings: UserSettings,
 ) -> None:
     settings = get_settings(context)
+    store = get_user_settings_store(context)
+    user_settings = store.ensure_selected_tickers(
+        user_settings.user_id,
+        get_all_tickers(context),
+    )
+    selected_tickers = user_settings.selected_tickers
+    if not selected_tickers:
+        logger.info(
+            "Turnover report skipped: user_id=%s selected_tickers=0",
+            user_settings.user_id,
+        )
+        await send_text(
+            update,
+            context,
+            EMPTY_SELECTED_TICKERS_TEXT,
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    logger.info(
+        "Turnover report selected tickers: user_id=%s count=%s",
+        user_settings.user_id,
+        len(selected_tickers),
+    )
     await send_text(update, context, "Готовлю отчёт по обороту...")
 
     try:
@@ -595,6 +688,7 @@ async def send_turnover_report(
             collect_moex_analysis,
             settings,
             user_settings.timeframe,
+            selected_tickers,
         )
     except FileNotFoundError:
         logger.exception("Tickers file was not found")
@@ -622,31 +716,232 @@ async def send_turnover_report(
     await send_text(update, context, text, reply_markup=report_actions_keyboard())
 
 
-async def send_tickers(
+async def send_tickers_menu(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    page: int = 0,
+) -> None:
+    user = update.effective_user
+    if user is None:
+        return
+
+    store = get_user_settings_store(context)
+    all_tickers = get_all_tickers(context)
+    user_settings = store.ensure_selected_tickers(user.id, all_tickers)
+    set_tickers_menu_page(context, user.id, page)
+    logger.info(
+        "User opened tickers menu: user_id=%s selected=%s total=%s page=%s",
+        user.id,
+        len(user_settings.selected_tickers),
+        len(all_tickers),
+        page,
+    )
+    await show_tickers_menu(
+        update,
+        context,
+        user_settings=user_settings,
+        all_tickers=all_tickers,
+        page=page,
+    )
+
+
+async def toggle_ticker_selection(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    callback_data: str,
+) -> None:
+    user = update.effective_user
+    if user is None:
+        return
+
+    ticker = callback_data.removeprefix(CALLBACK_TICKER_TOGGLE_PREFIX)
+    store = get_user_settings_store(context)
+    all_tickers = get_all_tickers(context)
+    user_settings = store.toggle_selected_ticker(user.id, ticker, all_tickers)
+    page = get_tickers_menu_page(context, user.id)
+    logger.info(
+        "User toggled ticker: user_id=%s ticker=%s selected=%s total=%s",
+        user.id,
+        ticker,
+        len(user_settings.selected_tickers),
+        len(all_tickers),
+    )
+    await show_tickers_menu(
+        update,
+        context,
+        user_settings=user_settings,
+        all_tickers=all_tickers,
+        page=page,
+    )
+
+
+async def select_all_tickers(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    settings = get_settings(context)
-    try:
-        tickers = load_tickers(settings.tickers_file)
-    except FileNotFoundError:
-        logger.exception("Tickers file was not found")
-        await send_text(
-            update,
-            context,
-            "Файл tickers.txt не найден.",
-            reply_markup=main_menu_keyboard(),
-        )
+    user = update.effective_user
+    if user is None:
         return
 
-    tickers_text = "\n".join(tickers) if tickers else "Список пуст."
+    store = get_user_settings_store(context)
+    all_tickers = get_all_tickers(context)
+    user_settings = store.select_all_tickers(user.id, all_tickers)
+    page = get_tickers_menu_page(context, user.id)
+    logger.info(
+        "User selected all tickers: user_id=%s selected=%s",
+        user.id,
+        len(user_settings.selected_tickers),
+    )
+    await show_tickers_menu(
+        update,
+        context,
+        user_settings=user_settings,
+        all_tickers=all_tickers,
+        page=page,
+    )
+
+
+async def clear_ticker_selection(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    user = update.effective_user
+    if user is None:
+        return
+
+    store = get_user_settings_store(context)
+    all_tickers = get_all_tickers(context)
+    user_settings = store.clear_selected_tickers(user.id)
+    page = get_tickers_menu_page(context, user.id)
+    logger.info("User cleared all tickers: user_id=%s", user.id)
+    await show_tickers_menu(
+        update,
+        context,
+        user_settings=user_settings,
+        all_tickers=all_tickers,
+        page=page,
+        notice=(
+            "Вы сняли все тикеры. Автоуведомления и ручная проверка не будут работать, "
+            "пока вы не выберете хотя бы один тикер."
+        ),
+    )
+
+
+async def save_ticker_selection(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    user = update.effective_user
+    if user is None:
+        return
+
+    store = get_user_settings_store(context)
+    all_tickers = get_all_tickers(context)
+    user_settings = store.ensure_selected_tickers(user.id, all_tickers)
+    page = get_tickers_menu_page(context, user.id)
+    logger.info(
+        "User saved tickers: user_id=%s selected=%s total=%s",
+        user.id,
+        len(user_settings.selected_tickers),
+        len(all_tickers),
+    )
+    await show_tickers_menu(
+        update,
+        context,
+        user_settings=user_settings,
+        all_tickers=all_tickers,
+        page=page,
+        notice=(
+            f"✅ Список тикеров сохранён. Выбрано: "
+            f"{len(user_settings.selected_tickers)} из {len(all_tickers)}."
+        ),
+    )
+
+
+async def show_tickers_menu(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    user_settings: UserSettings,
+    all_tickers: list[str],
+    page: int,
+    notice: str | None = None,
+) -> None:
+    total_pages = max(1, (len(all_tickers) + TICKERS_PAGE_SIZE - 1) // TICKERS_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    set_tickers_menu_page(context, user_settings.user_id, page)
     text = (
         "📋 Мои тикеры\n\n"
-        f"Количество тикеров: {len(tickers)}\n\n"
-        f"{tickers_text}\n\n"
-        "Список можно изменить в файле tickers.txt."
+        f"Выбрано: {len(user_settings.selected_tickers)} из {len(all_tickers)}\n\n"
+        "Нажмите на тикер, чтобы включить или отключить его.\n\n"
+        f"Страница {page + 1}/{total_pages}"
     )
-    await send_text(update, context, text, reply_markup=main_menu_keyboard())
+    if notice:
+        text = f"{text}\n\n{notice}"
+
+    await edit_or_send_text(
+        update,
+        context,
+        text,
+        reply_markup=build_tickers_keyboard(
+            user_settings.selected_tickers,
+            all_tickers,
+            page=page,
+            page_size=TICKERS_PAGE_SIZE,
+        ),
+    )
+
+
+async def edit_or_send_text(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+    *,
+    reply_markup: InlineKeyboardMarkup,
+) -> None:
+    query = update.callback_query
+    message = query.message if query is not None else None
+    edit_text = getattr(message, "edit_text", None)
+    if edit_text is not None:
+        try:
+            await edit_text(text, reply_markup=reply_markup)
+            return
+        except TelegramError:
+            logger.exception("Failed to edit tickers menu message")
+
+    await send_text(update, context, text, reply_markup=reply_markup)
+
+
+def parse_tickers_page(callback_data: str) -> int:
+    raw_page = callback_data.removeprefix(CALLBACK_TICKERS_PAGE_PREFIX)
+    try:
+        return max(0, int(raw_page))
+    except ValueError:
+        return 0
+
+
+def get_tickers_menu_page(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> int:
+    pages = context.application.bot_data.setdefault(TICKERS_MENU_PAGE_STATE_KEY, {})
+    if not isinstance(pages, dict):
+        pages = {}
+        context.application.bot_data[TICKERS_MENU_PAGE_STATE_KEY] = pages
+    try:
+        return max(0, int(pages.get(user_id, 0)))
+    except (TypeError, ValueError):
+        return 0
+
+
+def set_tickers_menu_page(
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    page: int,
+) -> None:
+    pages = context.application.bot_data.setdefault(TICKERS_MENU_PAGE_STATE_KEY, {})
+    if not isinstance(pages, dict):
+        pages = {}
+        context.application.bot_data[TICKERS_MENU_PAGE_STATE_KEY] = pages
+    pages[user_id] = max(0, int(page))
 
 
 async def send_settings(
@@ -711,7 +1006,7 @@ async def send_help(
 
 def count_tickers(settings: Settings) -> int:
     try:
-        return len(load_tickers(settings.tickers_file))
+        return len(get_available_tickers(settings.tickers_file, allow_missing=True))
     except FileNotFoundError:
         return 0
 
@@ -719,6 +1014,7 @@ def count_tickers(settings: Settings) -> int:
 async def post_init(application: Application) -> None:
     settings: Settings = application.bot_data["settings"]
     store: UserSettingsStore = application.bot_data["user_settings_store"]
+    all_tickers = get_available_tickers(settings.tickers_file, allow_missing=True)
 
     if settings.telegram_chat_id is not None:
         bootstrap_user_id = settings.allowed_user_id or settings.telegram_chat_id
@@ -726,6 +1022,7 @@ async def post_init(application: Application) -> None:
             chat_id=settings.telegram_chat_id,
             user_id=bootstrap_user_id,
         )
+        store.ensure_selected_tickers(bootstrap_user_id, all_tickers)
 
     application.bot_data["scheduler"] = start_scheduler(application)
 

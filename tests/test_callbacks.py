@@ -2,18 +2,21 @@ from __future__ import annotations
 
 import asyncio
 import unittest
+from datetime import datetime
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
-from bot import handle_callback
+from bot import EMPTY_SELECTED_TICKERS_TEXT, handle_callback, send_manual_report
 from telegram.error import TelegramError
 from keyboards import (
     CALLBACK_NOTIFICATIONS,
     CALLBACK_SETTINGS,
+    CALLBACK_TICKERS,
     MAIN_MENU,
     REFRESH,
     TIMEFRAME_MENU,
     after_timeframe_keyboard,
+    build_tickers_keyboard,
     main_menu_keyboard,
     main_menu_only_keyboard,
     normalize_callback_data,
@@ -65,6 +68,7 @@ class KeyboardCallbackTests(unittest.TestCase):
         self.assertIn(REFRESH, main_callbacks)
         self.assertIn(TIMEFRAME_MENU, main_callbacks)
         self.assertIn(CALLBACK_NOTIFICATIONS, main_callbacks)
+        self.assertIn(CALLBACK_TICKERS, main_callbacks)
         self.assertIn(CALLBACK_SETTINGS, main_callbacks)
         self.assertEqual(report_callbacks, [REFRESH, TIMEFRAME_MENU, MAIN_MENU])
         self.assertIn(REFRESH, notification_callbacks)
@@ -83,8 +87,29 @@ class KeyboardCallbackTests(unittest.TestCase):
 
     def test_legacy_callbacks_are_normalized(self) -> None:
         self.assertEqual(normalize_callback_data("menu:main"), MAIN_MENU)
+        self.assertEqual(normalize_callback_data("menu:tickers"), CALLBACK_TICKERS)
         self.assertEqual(normalize_callback_data("report:check"), REFRESH)
         self.assertEqual(normalize_callback_data("menu:timeframe"), TIMEFRAME_MENU)
+
+    def test_tickers_keyboard_is_paginated(self) -> None:
+        tickers = [f"T{i:02d}" for i in range(25)]
+        markup = build_tickers_keyboard(["T00", "T21"], tickers, page=1)
+        callbacks = callback_values(markup)
+        labels = [
+            button.text
+            for row in markup.inline_keyboard
+            for button in row
+        ]
+
+        self.assertIn("ticker_toggle:T20", callbacks)
+        self.assertIn("ticker_toggle:T24", callbacks)
+        self.assertNotIn("ticker_toggle:T00", callbacks)
+        self.assertIn("✅ T21", labels)
+        self.assertIn("❌ T20", labels)
+        self.assertIn("tickers_page:0", callbacks)
+        self.assertIn("tickers_all", callbacks)
+        self.assertIn("tickers_none", callbacks)
+        self.assertIn("tickers_save", callbacks)
 
 
 class CallbackHandlerTests(unittest.IsolatedAsyncioTestCase):
@@ -108,6 +133,7 @@ class CallbackHandlerTests(unittest.IsolatedAsyncioTestCase):
             (REFRESH, "bot.send_manual_report"),
             (TIMEFRAME_MENU, "bot.send_timeframe_menu"),
             (CALLBACK_NOTIFICATIONS, "bot.send_notifications_menu"),
+            (CALLBACK_TICKERS, "bot.send_tickers_menu"),
             (CALLBACK_SETTINGS, "bot.send_settings"),
         )
 
@@ -152,6 +178,55 @@ class CallbackHandlerTests(unittest.IsolatedAsyncioTestCase):
 
         query.answer.assert_awaited_once_with()
         send_main_menu.assert_awaited_once()
+
+
+class ManualReportTickerSelectionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_manual_report_warns_when_no_tickers_selected(self) -> None:
+        update = SimpleNamespace()
+        context = SimpleNamespace()
+        user_settings = SimpleNamespace(user_id=1, timeframe="1d", selected_tickers=[])
+        store = SimpleNamespace(ensure_selected_tickers=Mock(return_value=user_settings))
+
+        with (
+            patch("bot.get_settings", return_value=SimpleNamespace()),
+            patch("bot.get_user_settings_store", return_value=store),
+            patch("bot.get_all_tickers", return_value=["SBER"]),
+            patch("bot.send_text", new_callable=AsyncMock) as send_text,
+        ):
+            await send_manual_report(update, context, user_settings=user_settings)
+
+        send_text.assert_awaited_once()
+        self.assertEqual(send_text.await_args.args[2], EMPTY_SELECTED_TICKERS_TEXT)
+
+    async def test_manual_report_uses_selected_tickers(self) -> None:
+        update = SimpleNamespace()
+        context = SimpleNamespace()
+        settings = SimpleNamespace(timezone_name="Europe/Moscow")
+        user_settings = SimpleNamespace(
+            user_id=1,
+            timeframe="1d",
+            selected_tickers=["SBER"],
+        )
+        store = SimpleNamespace(
+            ensure_selected_tickers=Mock(return_value=user_settings),
+            save_last_report=Mock(),
+        )
+        result = SimpleNamespace(
+            tickers_count=0,
+            latest_candle_key=None,
+            updated_at=datetime(2026, 6, 4, 12, 0),
+        )
+
+        with (
+            patch("bot.get_settings", return_value=settings),
+            patch("bot.get_user_settings_store", return_value=store),
+            patch("bot.get_all_tickers", return_value=["SBER", "GAZP"]),
+            patch("bot.collect_moex_analysis", return_value=result) as collect,
+            patch("bot.send_text", new_callable=AsyncMock),
+        ):
+            await send_manual_report(update, context, user_settings=user_settings)
+
+        collect.assert_called_once_with(settings, "1d", ["SBER"])
 
 
 class SchedulerTriggerTests(unittest.IsolatedAsyncioTestCase):

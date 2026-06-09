@@ -107,8 +107,14 @@ class AnalysisResult:
         )
 
 
-def collect_moex_analysis(settings: Settings, timeframe: str) -> AnalysisResult:
-    tickers = load_tickers(settings.tickers_file)
+def collect_moex_analysis(
+    settings: Settings,
+    timeframe: str,
+    tickers: list[str] | tuple[str, ...] | None = None,
+) -> AnalysisResult:
+    selected_tickers = normalize_tickers(tickers)
+    if tickers is None:
+        selected_tickers = load_tickers(settings.tickers_file)
     client = MoexClient(
         board=settings.moex_board,
         timeout=settings.moex_timeout_seconds,
@@ -118,7 +124,7 @@ def collect_moex_analysis(settings: Settings, timeframe: str) -> AnalysisResult:
     try:
         return analyze_tickers(
             client=client,
-            tickers=tickers,
+            tickers=selected_tickers,
             timeframe=timeframe,
             timezone=settings.timezone,
         )
@@ -171,6 +177,21 @@ def analyze_tickers(
         moex_requests_count=int(getattr(client, "request_count", 0)),
         debug_last_candles=debug_last_candles,
     )
+
+
+def normalize_tickers(value: list[str] | tuple[str, ...] | None) -> list[str]:
+    if value is None:
+        return []
+
+    tickers: list[str] = []
+    seen: set[str] = set()
+    for raw_ticker in value:
+        ticker = str(raw_ticker).strip().upper()
+        if not ticker or ticker in seen:
+            continue
+        tickers.append(ticker)
+        seen.add(ticker)
+    return tickers
 
 
 def compare_last_two_candles(candles: list[Candle]) -> CandleComparison:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import unittest
 from datetime import datetime, time, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 from zoneinfo import ZoneInfo
@@ -10,6 +11,7 @@ from zoneinfo import ZoneInfo
 from scheduler import (
     AUTO_ONE_MINUTE_LAST_CHECK_KEY,
     AUTO_NOTIFICATIONS_LOCK_KEY,
+    DAILY_EMPTY_REPORT_TEXT,
     _run_auto_notifications,
     check_timeframe_notifications,
     get_expected_candle_key,
@@ -35,6 +37,7 @@ def schedule_settings():
         weekly_report_time=time(23, 55),
         monthly_report_time=time(23, 55),
         send_empty_reports_for_higher_timeframes=True,
+        tickers_file=Path("tickers.txt"),
     )
 
 
@@ -130,7 +133,7 @@ class ShouldCheckTimeframeTests(unittest.TestCase):
         thursday = moscow_datetime(2026, 6, 4, 23, 55, 10)
 
         self.assertTrue(should_check_timeframe("1d", thursday, self.settings))
-        self.assertFalse(
+        self.assertTrue(
             should_check_timeframe(
                 "1d",
                 moscow_datetime(2026, 6, 4, 23, 56, 10),
@@ -407,6 +410,104 @@ class SchedulerFilteringTests(unittest.IsolatedAsyncioTestCase):
 
         process.assert_awaited_once()
 
+    async def test_daily_uses_latest_available_closed_candle(self) -> None:
+        settings = schedule_settings()
+        result = SimpleNamespace(
+            latest_candle_key="2026-06-04",
+            moex_requests_count=1,
+            matched_items=[],
+        )
+
+        with (
+            patch("scheduler.collect_moex_analysis", return_value=result),
+            patch(
+                "scheduler.process_timeframe_notifications",
+                new_callable=AsyncMock,
+            ) as process,
+        ):
+            await check_timeframe_notifications(
+                application=SimpleNamespace(bot_data={}),
+                store=SimpleNamespace(),
+                settings=settings,
+                timeframe="1d",
+                users=[],
+                now=moscow_datetime(2026, 6, 4, 12, 0),
+            )
+
+        process.assert_awaited_once()
+
+    async def test_auto_notifications_use_selected_tickers(self) -> None:
+        settings = schedule_settings()
+        user = SimpleNamespace(
+            user_id=1,
+            chat_id=2,
+            selected_tickers=["SBER"],
+            last_processed_candle_keys={},
+        )
+        store = SimpleNamespace(
+            ensure_selected_tickers=Mock(return_value=user),
+            get_user=lambda _user_id: user,
+        )
+        result = SimpleNamespace(
+            latest_candle_key="2026-06-04",
+            moex_requests_count=1,
+            matched_items=[],
+        )
+
+        with (
+            patch("scheduler.get_available_tickers", return_value=["SBER", "GAZP"]),
+            patch("scheduler.collect_moex_analysis", return_value=result) as collect,
+            patch(
+                "scheduler.process_timeframe_notifications",
+                new_callable=AsyncMock,
+            ) as process,
+        ):
+            await check_timeframe_notifications(
+                application=SimpleNamespace(bot_data={}),
+                store=store,
+                settings=settings,
+                timeframe="1d",
+                users=[user],
+                now=moscow_datetime(2026, 6, 4, 12, 0),
+            )
+
+        collect.assert_called_once_with(settings, "1d", ["SBER"])
+        process.assert_awaited_once()
+
+    async def test_auto_notifications_skip_users_without_selected_tickers(self) -> None:
+        settings = schedule_settings()
+        user = SimpleNamespace(
+            user_id=1,
+            chat_id=2,
+            selected_tickers=[],
+            last_processed_candle_keys={},
+        )
+        store = SimpleNamespace(ensure_selected_tickers=Mock(return_value=user))
+
+        with (
+            patch("scheduler.get_available_tickers", return_value=["SBER"]),
+            patch("scheduler.collect_moex_analysis") as collect,
+            patch(
+                "scheduler.process_timeframe_notifications",
+                new_callable=AsyncMock,
+            ) as process,
+            self.assertLogs("scheduler", level="INFO") as logs,
+        ):
+            await check_timeframe_notifications(
+                application=SimpleNamespace(bot_data={}),
+                store=store,
+                settings=settings,
+                timeframe="1d",
+                users=[user],
+                now=moscow_datetime(2026, 6, 4, 12, 0),
+            )
+
+        collect.assert_not_called()
+        process.assert_not_awaited()
+        self.assertTrue(
+            any("selected_tickers=0" in line for line in logs.output)
+        )
+
     async def test_expected_hourly_candle_is_processed(self) -> None:
         settings = schedule_settings()
         settings.hourly_confirmation_delay_minutes = 0
@@ -560,6 +661,54 @@ class EmptyNotificationTests(unittest.IsolatedAsyncioTestCase):
 
                 send.assert_awaited_once()
                 self.assertTrue(store.record_auto_result.call_args.kwargs["sent"])
+
+    async def test_empty_daily_report_uses_fixed_text_even_when_disabled(self) -> None:
+        user = self.notification_user("1d")
+        store = SimpleNamespace(
+            get_user=lambda _user_id: user,
+            record_auto_result=Mock(),
+        )
+        settings = SimpleNamespace(
+            send_empty_reports_for_higher_timeframes=False,
+            timezone_name="Europe/Moscow",
+        )
+        result = SimpleNamespace(
+            latest_candle_key="2026-06-04",
+            previous_candle_key="2026-06-03",
+            matched_items=[],
+        )
+        application = SimpleNamespace()
+
+        with (
+            patch(
+                "scheduler.build_empty_auto_notification_report",
+                return_value="empty report",
+            ) as build_empty,
+            patch("scheduler.send_scheduled_report", new_callable=AsyncMock) as send,
+        ):
+            await process_timeframe_notifications(
+                application=application,
+                store=store,
+                settings=settings,
+                timeframe="1d",
+                users=[user],
+                result=result,
+            )
+
+        build_empty.assert_not_called()
+        send.assert_awaited_once_with(
+            application=application,
+            chat_id=2,
+            text=DAILY_EMPTY_REPORT_TEXT,
+        )
+        store.record_auto_result.assert_called_once_with(
+            user_id=1,
+            timeframe="1d",
+            candle_key="2026-06-04",
+            previous_candle_key="2026-06-03",
+            matched_tickers=[],
+            sent=True,
+        )
 
     async def test_matching_ticker_after_processed_empty_candle_sends_normal_report(self) -> None:
         user = self.notification_user("1h", processed="2026-06-04 18:00")
