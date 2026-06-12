@@ -4,7 +4,7 @@ import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, tzinfo
 
-from config import Settings
+from config import INTRADAY_TIMEFRAME_MINUTES, SUPPORTED_TIMEFRAMES, Settings
 from moex_client import (
     Candle,
     MarketDataError,
@@ -12,6 +12,7 @@ from moex_client import (
     candle_close_time,
     candle_key,
 )
+from tinkoff_client import collect_tinvest_analysis
 from utils import load_tickers, timeframe_label, timezone_label
 
 
@@ -32,11 +33,10 @@ MONTH_NAMES = {
     12: "декабрь",
 }
 
-INTRADAY_TIMEFRAME_MINUTES = {
-    "1m": 1,
-    "10m": 10,
-    "1h": 60,
-}
+MOEX_SOURCE = "MOEX"
+TINVEST_SOURCE = "TINVEST"
+KNOWN_DATA_SOURCES = {MOEX_SOURCE, TINVEST_SOURCE}
+MOEX_FALLBACK_TIMEFRAMES = {"1m", "10m", "1h", "1d", "1w", "1mo"}
 
 TRADING_CONDITION_TEXT = "close последней закрытой свечи > high предыдущей закрытой свечи"
 
@@ -57,7 +57,10 @@ class AnalysisResult:
     failures: list[tuple[str, str]]
     updated_at: datetime
     tickers_count: int
+    source: str = MOEX_SOURCE
+    fallback_used: bool = False
     moex_requests_count: int = 0
+    tinvest_requests_count: int = 0
     debug_last_candles: list[Candle] = field(default_factory=list)
 
     @property
@@ -70,28 +73,36 @@ class AnalysisResult:
         )
 
     @property
-    def latest_candle_key(self) -> str | None:
+    def latest_raw_candle_key(self) -> str | None:
         reference = self.reference_comparison
         if reference is None:
             return None
         return candle_key(reference.last, self.timeframe)
 
     @property
-    def previous_candle_key(self) -> str | None:
+    def previous_raw_candle_key(self) -> str | None:
         reference = self.reference_comparison
         if reference is None:
             return None
         return candle_key(reference.previous, self.timeframe)
 
     @property
+    def latest_candle_key(self) -> str | None:
+        return prefixed_candle_key(self.source, self.latest_raw_candle_key)
+
+    @property
+    def previous_candle_key(self) -> str | None:
+        return prefixed_candle_key(self.source, self.previous_raw_candle_key)
+
+    @property
     def current_period_items(self) -> list[CandleComparison]:
-        latest_candle_key = self.latest_candle_key
-        if latest_candle_key is None:
+        latest_raw_candle_key = self.latest_raw_candle_key
+        if latest_raw_candle_key is None:
             return []
         return [
             item
             for item in self.comparisons
-            if candle_key(item.last, self.timeframe) == latest_candle_key
+            if candle_key(item.last, self.timeframe) == latest_raw_candle_key
         ]
 
     @property
@@ -105,6 +116,73 @@ class AnalysisResult:
             key=lambda item: item.last.value or 0,
             reverse=True,
         )
+
+
+def collect_market_analysis(
+    settings: Settings,
+    timeframe: str,
+    tickers: list[str] | tuple[str, ...] | None = None,
+) -> AnalysisResult:
+    if timeframe not in SUPPORTED_TIMEFRAMES:
+        raise MarketDataError(f"Unsupported timeframe: {timeframe}")
+
+    selected_tickers = normalize_tickers(tickers)
+    if tickers is None:
+        selected_tickers = load_tickers(settings.tickers_file)
+
+    if _should_use_tinvest_primary(settings):
+        logger.info("Market data source selected: timeframe=%s source=TINVEST", timeframe)
+        try:
+            result = collect_tinvest_analysis(settings, selected_tickers, timeframe)
+        except Exception as exc:
+            logger.warning("T-Invest API error: %s", exc)
+            return _collect_moex_fallback_or_empty(
+                settings,
+                timeframe,
+                selected_tickers,
+                reason=str(exc),
+            )
+
+        failed_tickers = [ticker for ticker, _error in result.failures]
+        if failed_tickers and _can_use_moex_fallback(settings, timeframe):
+            logger.warning(
+                "fallback to MOEX reason=T-Invest failed for %s tickers timeframe=%s",
+                len(failed_tickers),
+                timeframe,
+            )
+            fallback = collect_moex_analysis(settings, timeframe, failed_tickers)
+            fallback_failed = {ticker for ticker, _error in fallback.failures}
+            retained_failures = [
+                failure
+                for failure in result.failures
+                if failure[0] in fallback_failed
+            ]
+            return AnalysisResult(
+                timeframe=timeframe,
+                comparisons=[*result.comparisons, *fallback.comparisons],
+                failures=[*retained_failures, *fallback.failures],
+                updated_at=result.updated_at,
+                tickers_count=len(selected_tickers),
+                source=TINVEST_SOURCE,
+                fallback_used=True,
+                moex_requests_count=fallback.moex_requests_count,
+                tinvest_requests_count=result.tinvest_requests_count,
+                debug_last_candles=result.debug_last_candles or fallback.debug_last_candles,
+            )
+
+        if failed_tickers and timeframe not in MOEX_FALLBACK_TIMEFRAMES:
+            logger.warning("No MOEX fallback available for timeframe=%s", timeframe)
+        return result
+
+    if not getattr(settings, "tinkoff_invest_token", ""):
+        logger.warning("T-Invest token is missing. Using MOEX fallback.")
+
+    return _collect_moex_fallback_or_empty(
+        settings,
+        timeframe,
+        selected_tickers,
+        reason="T-Invest primary disabled or token missing",
+    )
 
 
 def collect_moex_analysis(
@@ -127,9 +205,56 @@ def collect_moex_analysis(
             tickers=selected_tickers,
             timeframe=timeframe,
             timezone=settings.timezone,
+            source=MOEX_SOURCE,
         )
     finally:
         client.close()
+
+
+def _collect_moex_fallback_or_empty(
+    settings: Settings,
+    timeframe: str,
+    tickers: list[str],
+    *,
+    reason: str,
+) -> AnalysisResult:
+    if not _can_use_moex_fallback(settings, timeframe):
+        if timeframe not in MOEX_FALLBACK_TIMEFRAMES:
+            logger.warning("No MOEX fallback available for timeframe=%s", timeframe)
+        elif not getattr(settings, "use_moex_fallback", True):
+            logger.warning(
+                "MOEX fallback disabled: timeframe=%s reason=%s",
+                timeframe,
+                reason,
+            )
+        else:
+            logger.warning("No MOEX fallback available for timeframe=%s", timeframe)
+        return AnalysisResult(
+            timeframe=timeframe,
+            comparisons=[],
+            failures=[(ticker, reason) for ticker in tickers],
+            updated_at=datetime.now(settings.timezone),
+            tickers_count=len(tickers),
+            source=TINVEST_SOURCE,
+        )
+
+    logger.warning("fallback to MOEX reason=%s timeframe=%s", reason, timeframe)
+    logger.info("Market data source selected: timeframe=%s source=MOEX", timeframe)
+    return collect_moex_analysis(settings, timeframe, tickers)
+
+
+def _should_use_tinvest_primary(settings: Settings) -> bool:
+    return bool(
+        getattr(settings, "use_tinvest_as_primary", True)
+        and str(getattr(settings, "tinkoff_invest_token", "") or "").strip()
+    )
+
+
+def _can_use_moex_fallback(settings: Settings, timeframe: str) -> bool:
+    return bool(
+        getattr(settings, "use_moex_fallback", True)
+        and timeframe in MOEX_FALLBACK_TIMEFRAMES
+    )
 
 
 def analyze_tickers(
@@ -138,6 +263,7 @@ def analyze_tickers(
     tickers: list[str],
     timeframe: str,
     timezone: tzinfo,
+    source: str = MOEX_SOURCE,
 ) -> AnalysisResult:
     comparisons: list[CandleComparison] = []
     failures: list[tuple[str, str]] = []
@@ -174,6 +300,7 @@ def analyze_tickers(
         failures=failures,
         updated_at=datetime.now(timezone),
         tickers_count=len(tickers),
+        source=source,
         moex_requests_count=int(getattr(client, "request_count", 0)),
         debug_last_candles=debug_last_candles,
     )
@@ -192,6 +319,39 @@ def normalize_tickers(value: list[str] | tuple[str, ...] | None) -> list[str]:
         tickers.append(ticker)
         seen.add(ticker)
     return tickers
+
+
+def prefixed_candle_key(source: str, candle_key_value: str | None) -> str | None:
+    if candle_key_value is None:
+        return None
+    value = str(candle_key_value).strip()
+    if not value:
+        return value
+    prefix, separator, rest = value.partition(":")
+    if separator and prefix.upper() in KNOWN_DATA_SOURCES and rest:
+        return f"{prefix.upper()}:{rest}"
+    normalized_source = source.upper()
+    if normalized_source not in KNOWN_DATA_SOURCES:
+        normalized_source = MOEX_SOURCE
+    return f"{normalized_source}:{value}"
+
+
+def strip_candle_key_source(candle_key_value: str | None) -> str | None:
+    if candle_key_value is None:
+        return None
+    value = str(candle_key_value).strip()
+    prefix, separator, rest = value.partition(":")
+    if separator and prefix.upper() in KNOWN_DATA_SOURCES and rest:
+        return rest
+    return value
+
+
+def data_source_report_label(result: AnalysisResult) -> str:
+    if result.source == TINVEST_SOURCE and result.fallback_used:
+        return "T-Invest API + MOEX ISS API fallback"
+    if result.source == TINVEST_SOURCE:
+        return "T-Invest API"
+    return "MOEX ISS API"
 
 
 def compare_last_two_candles(candles: list[Candle]) -> CandleComparison:
@@ -229,6 +389,7 @@ def build_manual_report(result: AnalysisResult, *, timezone_name: str) -> str:
         TRADING_CONDITION_TEXT,
         "",
     ]
+    lines.extend(format_data_source_lines(result))
     lines.extend(format_reference_period_lines(result, timezone_name=timezone_name))
 
     matched_items = result.matched_items
@@ -269,6 +430,7 @@ def build_auto_notification_report(
         TRADING_CONDITION_TEXT,
         "",
     ]
+    lines.extend(format_data_source_lines(result))
     lines.extend(format_reference_period_lines(result, timezone_name=timezone_name))
 
     matched_items = result.matched_items
@@ -320,6 +482,7 @@ def build_hourly_supplement_report(
         "Новые тикеры по той же закрытой часовой свече:",
         "",
     ]
+    lines.extend(format_data_source_lines(result))
     lines.extend(format_reference_period_lines(result, timezone_name=timezone_name))
     append_auto_condition_items(lines, supplement_items, streaks=streaks)
 
@@ -400,6 +563,8 @@ def build_empty_auto_notification_report(
     else:
         raise ValueError(f"Empty auto reports are not supported for {timeframe}")
 
+    lines.extend(["", *format_data_source_lines(result)])
+
     if result.failures:
         lines.extend(["", *format_failures(result.failures)])
 
@@ -426,6 +591,7 @@ def build_turnover_report(
         "Используются только закрытые свечи.",
         "",
     ]
+    lines.extend(format_data_source_lines(result))
     lines.extend(format_reference_period_lines(result, timezone_name=timezone_name))
 
     turnover_items = result.turnover_items[:limit]
@@ -541,6 +707,10 @@ def format_reference_period_lines(
     ]
 
 
+def format_data_source_lines(result: AnalysisResult) -> list[str]:
+    return [f"Источник данных: {data_source_report_label(result)}", ""]
+
+
 def format_period(candle: Candle, timeframe: str) -> str:
     if timeframe in INTRADAY_TIMEFRAME_MINUTES:
         end = candle_close_time(candle, timeframe) - timedelta(minutes=1)
@@ -557,6 +727,7 @@ def format_period(candle: Candle, timeframe: str) -> str:
 
 
 def format_candle_key_period(candle_key_value: str, timeframe: str) -> str:
+    candle_key_value = strip_candle_key_source(candle_key_value) or ""
     try:
         if timeframe in INTRADAY_TIMEFRAME_MINUTES:
             begin = datetime.strptime(candle_key_value, "%Y-%m-%d %H:%M")

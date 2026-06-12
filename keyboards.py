@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
+from config import SUPPORTED_TIMEFRAMES
 from utils import TIMEFRAME_LABELS
 
 
@@ -149,41 +150,19 @@ def build_timeframe_keyboard(
             return f"✅ {label}"
         return label
 
-    return InlineKeyboardMarkup(
-        [
+    rows: list[list[InlineKeyboardButton]] = []
+    for index in range(0, len(SUPPORTED_TIMEFRAMES), 2):
+        rows.append(
             [
                 InlineKeyboardButton(
-                    button_label("1m"),
-                    callback_data=f"{prefix}1m",
-                ),
-                InlineKeyboardButton(
-                    button_label("10m"),
-                    callback_data=f"{prefix}10m",
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    button_label("1h"),
-                    callback_data=f"{prefix}1h",
-                ),
-                InlineKeyboardButton(
-                    button_label("1d"),
-                    callback_data=f"{prefix}1d",
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    button_label("1w"),
-                    callback_data=f"{prefix}1w",
-                ),
-                InlineKeyboardButton(
-                    button_label("1mo"),
-                    callback_data=f"{prefix}1mo",
-                ),
-            ],
-            [InlineKeyboardButton("⬅️ Назад", callback_data=back_to)],
-        ]
-    )
+                    button_label(timeframe),
+                    callback_data=f"{prefix}{timeframe}",
+                )
+                for timeframe in SUPPORTED_TIMEFRAMES[index : index + 2]
+            ]
+        )
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data=back_to)])
+    return InlineKeyboardMarkup(rows)
 
 
 def after_timeframe_keyboard() -> InlineKeyboardMarkup:

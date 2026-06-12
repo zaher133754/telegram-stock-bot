@@ -12,12 +12,15 @@ from apscheduler.triggers.interval import IntervalTrigger
 from telegram.ext import Application
 
 from analytics import (
+    MOEX_FALLBACK_TIMEFRAMES,
     build_auto_notification_report,
     build_empty_auto_notification_report,
     build_hourly_supplement_report,
-    collect_moex_analysis,
+    collect_market_analysis,
+    prefixed_candle_key,
+    strip_candle_key_source,
 )
-from config import SUPPORTED_TIMEFRAMES, Settings
+from config import INTRADAY_TIMEFRAME_MINUTES, SUPPORTED_TIMEFRAMES, Settings
 from instruments import get_available_tickers
 from keyboards import report_actions_keyboard
 from moex_client import candle_key
@@ -36,7 +39,7 @@ AUTO_NOTIFICATIONS_TASK_KEY = "auto_notifications_task"
 AUTO_NOTIFICATIONS_LOCK_KEY = "auto_notifications_lock"
 AUTO_HOURLY_FIRST_SEEN_KEY = "auto_hourly_first_seen"
 AUTO_ONE_MINUTE_LAST_CHECK_KEY = "auto_one_minute_last_check"
-AUTO_TIMEFRAME_PRIORITY = ("1h", "10m", "1m", "1d", "1w", "1mo")
+AUTO_TIMEFRAME_PRIORITY = SUPPORTED_TIMEFRAMES
 EMPTY_REPORT_TIMEFRAMES = frozenset({"1h", "1d", "1w", "1mo"})
 DAILY_EMPTY_REPORT_TEXT = "По дневному таймфрейму сигналов нет"
 DEFAULT_REPORT_TIME = datetime(2000, 1, 1, 23, 55).time()
@@ -54,25 +57,13 @@ def get_expected_candle_key(
         else now_msk
     )
 
-    if timeframe == "1m":
-        expected_begin = current_time.replace(second=0, microsecond=0) - timedelta(
-            minutes=1
-        )
-        return expected_begin.strftime("%Y-%m-%d %H:%M")
-
-    if timeframe == "10m":
-        boundary_minute = current_time.minute // 10 * 10
-        boundary = current_time.replace(
-            minute=boundary_minute,
-            second=0,
-            microsecond=0,
-        )
-        expected_begin = boundary - timedelta(minutes=10)
-        return expected_begin.strftime("%Y-%m-%d %H:%M")
-
-    if timeframe == "1h":
-        boundary = current_time.replace(minute=0, second=0, microsecond=0)
-        expected_begin = boundary - timedelta(hours=1)
+    if timeframe in INTRADAY_TIMEFRAME_MINUTES:
+        timeframe_minutes = INTRADAY_TIMEFRAME_MINUTES[timeframe]
+        minute_of_day = current_time.hour * 60 + current_time.minute
+        boundary_minute_of_day = minute_of_day // timeframe_minutes * timeframe_minutes
+        day_start = current_time.replace(hour=0, minute=0, second=0, microsecond=0)
+        boundary = day_start + timedelta(minutes=boundary_minute_of_day)
+        expected_begin = boundary - timedelta(minutes=timeframe_minutes)
         return expected_begin.strftime("%Y-%m-%d %H:%M")
 
     if timeframe == "1d":
@@ -225,12 +216,24 @@ async def _run_auto_notifications(
         if timeframe in SUPPORTED_TIMEFRAMES and timeframe in users_by_timeframe
     ]
     logger.info("Enabled timeframes: %s", ", ".join(enabled_timeframes))
+    for user in users:
+        logger.info(
+            "Enabled timeframes resolved: user_id=%s notification_timeframes=%s enabled_timeframes=%s",
+            getattr(user, "user_id", None),
+            user.notification_timeframes,
+            enabled_timeframes,
+        )
 
     due_timeframes: list[str] = []
     for timeframe in enabled_timeframes:
         reason = timeframe_skip_reason(timeframe, current_time, settings)
         if reason is None and timeframe == "1m":
-            reason = one_minute_throttle_skip_reason(application, current_time, settings)
+            reason = one_minute_throttle_skip_reason(
+                application,
+                current_time,
+                settings,
+                source=selected_market_data_source(settings),
+            )
         if reason is not None:
             logger.info("Skipping timeframe: %s, reason: %s", timeframe, reason)
             continue
@@ -249,7 +252,7 @@ async def _run_auto_notifications(
             users=users_by_timeframe[timeframe],
             now=current_time,
         )
-        if timeframe == "1m":
+        if timeframe == "1m" and selected_market_data_source(settings) == "MOEX":
             application.bot_data[AUTO_ONE_MINUTE_LAST_CHECK_KEY] = current_time
 
 
@@ -273,9 +276,17 @@ async def check_timeframe_notifications(
         current_time,
         settings=settings,
     )
-    logger.info("Checking timeframe: %s", timeframe)
+    expected_processed_candle_key = preferred_candle_key_for_settings(
+        settings,
+        expected_candle_key,
+    )
+    logger.info(
+        "Checking timeframe: %s source=%s",
+        timeframe,
+        selected_market_data_source(settings),
+    )
     try:
-        if timeframe == "1h":
+        if timeframe == "1h" and not is_tinvest_primary_available(settings):
             logger.info(
                 "1h notification check: now_msk=%s expected_candle_key=%s "
                 "empty_report_enabled=%s",
@@ -315,15 +326,20 @@ async def check_timeframe_notifications(
             return
 
         processed_check_users = active_users if users else users
-        if timeframe in {"1m", "10m"} and all_users_processed_candle(
+        if timeframe in INTRADAY_TIMEFRAME_MINUTES and all_users_processed_candle(
             processed_check_users,
             timeframe=timeframe,
-            candle_key=expected_candle_key,
+            candle_key=expected_processed_candle_key,
         ):
+            if timeframe == "1m":
+                logger.info(
+                    "already processed timeframe=1m candle=%s",
+                    expected_processed_candle_key,
+                )
             logger.info(
                 "Auto notification already processed by all users: timeframe=%s candle=%s",
                 timeframe,
-                expected_candle_key,
+                expected_processed_candle_key,
             )
             return
 
@@ -335,14 +351,15 @@ async def check_timeframe_notifications(
                 len(selected_tickers) if selected_tickers is not None else "default",
             )
             result = await asyncio.to_thread(
-                collect_moex_analysis,
+                collect_market_analysis,
                 settings,
                 timeframe,
                 selected_tickers,
             )
             requests_count += result.moex_requests_count
 
-            latest_available_candle_key = result.latest_candle_key
+            latest_available_candle_key = result.latest_raw_candle_key
+            previous_available_candle_key = result.previous_raw_candle_key
             if latest_available_candle_key is None:
                 logger.info("No closed candle data for auto notification %s", timeframe)
                 if timeframe == "1h":
@@ -358,9 +375,23 @@ async def check_timeframe_notifications(
 
             if timeframe == "1h":
                 logger.info(
-                    "1h notification data ready: candle_key=%s matched_tickers=%s",
+                    "1h notification data ready: candle_key=%s "
+                    "latest_closed_candle_key=%s previous_closed_candle_key=%s "
+                    "source=%s matched_tickers=%s",
+                    result.latest_candle_key,
                     latest_available_candle_key,
+                    previous_available_candle_key,
+                    getattr(result, "source", "MOEX"),
                     len(result.matched_items),
+                )
+            else:
+                logger.info(
+                    "Candle data ready: timeframe=%s source=%s "
+                    "latest_closed_candle_key=%s previous_closed_candle_key=%s",
+                    timeframe,
+                    getattr(result, "source", "MOEX"),
+                    result.latest_candle_key,
+                    result.previous_candle_key,
                 )
 
             if timeframe != "1d" and latest_available_candle_key < expected_candle_key:
@@ -400,11 +431,15 @@ async def check_timeframe_notifications(
                     )
                 continue
 
-            if timeframe == "1h" and not mark_hourly_candle_seen_or_ready(
-                application,
-                candle_key_value=latest_available_candle_key,
-                now=current_time,
-                settings=settings,
+            if (
+                timeframe == "1h"
+                and getattr(result, "source", "MOEX") != "TINVEST"
+                and not mark_hourly_candle_seen_or_ready(
+                    application,
+                    candle_key_value=latest_available_candle_key,
+                    now=current_time,
+                    settings=settings,
+                )
             ):
                 log_hourly_auto_debug(
                     now_msk=current_time,
@@ -423,6 +458,16 @@ async def check_timeframe_notifications(
                 timeframe=timeframe,
                 users=group_users,
                 result=result,
+            )
+            logger.info(
+                "timeframe=%s checked matched_tickers=%s status=%s",
+                timeframe,
+                len(result.matched_items),
+                "sent"
+                if sent
+                else "no_matches"
+                if not result.matched_items
+                else "not_sent",
             )
             if timeframe == "1h":
                 log_hourly_auto_debug(
@@ -488,21 +533,60 @@ def one_minute_throttle_skip_reason(
     application: Application,
     now: datetime,
     settings: Settings,
+    *,
+    source: str,
 ) -> str | None:
     interval_seconds = max(
         60,
         int(getattr(settings, "one_minute_check_interval_seconds", 180)),
     )
     last_check = application.bot_data.get(AUTO_ONE_MINUTE_LAST_CHECK_KEY)
-    if not isinstance(last_check, datetime):
+    current_time = _as_settings_timezone(now, settings)
+    normalized_source = str(source).upper()
+    throttle_enabled = normalized_source != "TINVEST"
+    remaining_seconds: int | None = None
+
+    if not throttle_enabled:
+        logger.info(
+            "1m throttle decision: source=%s throttle_enabled=false remaining_seconds=%s last_check_at=%s now=%s",
+            normalized_source,
+            remaining_seconds,
+            last_check.isoformat(sep=" ", timespec="seconds")
+            if isinstance(last_check, datetime)
+            else None,
+            current_time.isoformat(sep=" ", timespec="seconds"),
+        )
         return None
 
-    current_time = _as_settings_timezone(now, settings)
+    if not isinstance(last_check, datetime):
+        logger.info(
+            "1m throttle decision: source=%s throttle_enabled=true remaining_seconds=%s last_check_at=%s now=%s",
+            normalized_source,
+            remaining_seconds,
+            None,
+            current_time.isoformat(sep=" ", timespec="seconds"),
+        )
+        return None
+
     previous_time = _as_settings_timezone(last_check, settings)
     elapsed_seconds = (current_time - previous_time).total_seconds()
     if elapsed_seconds < interval_seconds:
         remaining_seconds = int(interval_seconds - elapsed_seconds)
+        logger.info(
+            "1m throttle decision: source=%s throttle_enabled=true remaining_seconds=%s last_check_at=%s now=%s",
+            normalized_source,
+            remaining_seconds,
+            previous_time.isoformat(sep=" ", timespec="seconds"),
+            current_time.isoformat(sep=" ", timespec="seconds"),
+        )
         return f"1m throttled for {remaining_seconds} more seconds"
+    logger.info(
+        "1m throttle decision: source=%s throttle_enabled=true remaining_seconds=%s last_check_at=%s now=%s",
+        normalized_source,
+        remaining_seconds,
+        previous_time.isoformat(sep=" ", timespec="seconds"),
+        current_time.isoformat(sep=" ", timespec="seconds"),
+    )
     return None
 
 
@@ -517,17 +601,9 @@ def timeframe_skip_reason(
     if timeframe == "1m":
         return None
 
-    if timeframe == "10m":
-        seconds_since_boundary = current_time.minute % 10 * 60 + current_time.second
-        if _is_in_delay_window(
-            seconds_since_boundary,
-            delay_seconds=config.intraday_check_delay_seconds,
-            interval_seconds=interval_seconds,
-        ):
-            return None
-        return "not 10-minute candle boundary"
-
     if timeframe == "1h":
+        if is_tinvest_primary_available(config):
+            return None
         window_minutes = max(
             1,
             min(59, int(getattr(config, "hourly_check_window_minutes", 20))),
@@ -535,6 +611,26 @@ def timeframe_skip_reason(
         if 1 <= current_time.minute <= window_minutes:
             return None
         return f"not within first {window_minutes} minutes after hour boundary"
+
+    if timeframe in INTRADAY_TIMEFRAME_MINUTES:
+        if (
+            not is_tinvest_primary_available(config)
+            and timeframe not in MOEX_FALLBACK_TIMEFRAMES
+        ):
+            return None
+
+        timeframe_seconds = INTRADAY_TIMEFRAME_MINUTES[timeframe] * 60
+        seconds_since_midnight = (
+            current_time.hour * 3600 + current_time.minute * 60 + current_time.second
+        )
+        seconds_since_boundary = seconds_since_midnight % timeframe_seconds
+        if _is_in_delay_window(
+            seconds_since_boundary,
+            delay_seconds=config.intraday_check_delay_seconds,
+            interval_seconds=interval_seconds,
+        ):
+            return None
+        return f"not {timeframe} candle boundary"
 
     if timeframe == "1d":
         return None
@@ -570,10 +666,30 @@ def all_users_processed_candle(
     timeframe: str,
     candle_key: str,
 ) -> bool:
+    normalized_candle_key = str(candle_key)
     return bool(users) and all(
-        user.last_processed_candle_keys.get(timeframe) == candle_key
+        user.last_processed_candle_keys.get(timeframe) == normalized_candle_key
         for user in users
     )
+
+
+def is_tinvest_primary_available(settings: Settings) -> bool:
+    return bool(
+        getattr(settings, "use_tinvest_as_primary", True)
+        and str(getattr(settings, "tinkoff_invest_token", "") or "").strip()
+    )
+
+
+def selected_market_data_source(settings: Settings) -> str:
+    return "TINVEST" if is_tinvest_primary_available(settings) else "MOEX"
+
+
+def preferred_candle_key_for_settings(
+    settings: Settings,
+    candle_key_value: str,
+) -> str:
+    source = selected_market_data_source(settings)
+    return prefixed_candle_key(source, candle_key_value) or candle_key_value
 
 
 def hourly_confirmation_pending_reason(
@@ -740,9 +856,10 @@ def format_debug_candles(candles) -> str:
 def short_candle_key_for_log(candle_key_value: str | None, timeframe: str) -> str | None:
     if candle_key_value is None:
         return None
-    if timeframe in {"1m", "10m", "1h"}:
-        return candle_key_value[-5:]
-    return candle_key_value
+    raw_candle_key = strip_candle_key_source(candle_key_value) or candle_key_value
+    if timeframe in INTRADAY_TIMEFRAME_MINUTES:
+        return raw_candle_key[-5:]
+    return raw_candle_key
 
 
 async def process_timeframe_notifications(
@@ -802,6 +919,11 @@ async def process_timeframe_notifications(
                 timeframe,
                 latest_candle_key,
             )
+            if timeframe == "1m":
+                logger.info(
+                    "already processed timeframe=1m candle=%s",
+                    latest_candle_key,
+                )
             continue
 
         if not matched_tickers:

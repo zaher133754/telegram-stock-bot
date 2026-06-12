@@ -11,11 +11,34 @@ from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent
 MOEX_TIMEZONE_NAME = "Europe/Moscow"
-SUPPORTED_TIMEFRAMES = ("1m", "10m", "1h", "1d", "1w", "1mo")
-TIMEFRAME_ALIASES = {
-    "5m": "1m",
-    "15m": "10m",
+SUPPORTED_TIMEFRAMES = (
+    "1m",
+    "2m",
+    "3m",
+    "5m",
+    "10m",
+    "15m",
+    "30m",
+    "1h",
+    "2h",
+    "4h",
+    "1d",
+    "1w",
+    "1mo",
+)
+INTRADAY_TIMEFRAME_MINUTES = {
+    "1m": 1,
+    "2m": 2,
+    "3m": 3,
+    "5m": 5,
+    "10m": 10,
+    "15m": 15,
+    "30m": 30,
+    "1h": 60,
+    "2h": 120,
+    "4h": 240,
 }
+TIMEFRAME_ALIASES: dict[str, str] = {}
 WEEKDAY_NAMES = {
     "MONDAY": 0,
     "TUESDAY": 1,
@@ -44,6 +67,13 @@ class Settings:
     moex_board: str
     moex_timeout_seconds: float
     scheduler_interval_seconds: int
+    tinkoff_invest_token: str = ""
+    use_tinvest_as_primary: bool = True
+    use_moex_fallback: bool = True
+    use_tinvest_for_5m: bool = True
+    use_tinvest_for_1h: bool = True
+    tinvest_instruments_cache_file: Path = BASE_DIR / "tinkoff_instruments_cache.json"
+    tinvest_request_timeout_seconds: int = 20
     moex_request_retries: int = 3
     intraday_check_delay_seconds: int = 30
     one_minute_check_interval_seconds: int = 180
@@ -235,6 +265,19 @@ def load_settings() -> Settings:
         log_file=_path_from_env("LOG_FILE", "bot.log"),
         moex_board=_get_env("MOEX_BOARD", "TQBR").upper(),
         moex_timeout_seconds=timeout_seconds,
+        tinkoff_invest_token=_get_env("TINKOFF_INVEST_TOKEN"),
+        use_tinvest_as_primary=_bool_from_env("USE_TINVEST_AS_PRIMARY", True),
+        use_moex_fallback=_bool_from_env("USE_MOEX_FALLBACK", True),
+        use_tinvest_for_5m=_bool_from_env("USE_TINVEST_FOR_5M", True),
+        use_tinvest_for_1h=_bool_from_env("USE_TINVEST_FOR_1H", True),
+        tinvest_instruments_cache_file=_path_from_env(
+            "TINVEST_INSTRUMENTS_CACHE_FILE",
+            "tinkoff_instruments_cache.json",
+        ),
+        tinvest_request_timeout_seconds=_int_from_env(
+            "TINVEST_REQUEST_TIMEOUT_SECONDS",
+            20,
+        ),
         moex_request_retries=_int_from_env("MOEX_REQUEST_RETRIES", 3),
         scheduler_interval_seconds=_aliased_int_from_env(
             "AUTO_SCHEDULER_INTERVAL_SECONDS",

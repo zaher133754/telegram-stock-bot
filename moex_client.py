@@ -9,6 +9,8 @@ from zoneinfo import ZoneInfo
 
 import requests
 
+from config import INTRADAY_TIMEFRAME_MINUTES, SUPPORTED_TIMEFRAMES
+
 
 logger = logging.getLogger(__name__)
 
@@ -62,12 +64,7 @@ DIRECT_TIMEFRAME_INTERVALS = {
     "1w": 7,
     "1mo": 31,
 }
-SUPPORTED_TIMEFRAMES = set(DIRECT_TIMEFRAME_INTERVALS)
-INTRADAY_TIMEFRAME_MINUTES = {
-    "1m": 1,
-    "10m": 10,
-    "1h": 60,
-}
+MOEX_SUPPORTED_TIMEFRAMES = set(DIRECT_TIMEFRAME_INTERVALS)
 
 
 def get_candles(
@@ -201,6 +198,8 @@ class MoexClient:
         timeframe = _validate_timeframe(timeframe)
         if limit <= 0:
             return []
+        if timeframe not in MOEX_SUPPORTED_TIMEFRAMES:
+            raise MarketDataError(f"Unsupported MOEX timeframe: {timeframe}")
 
         interval = DIRECT_TIMEFRAME_INTERVALS[timeframe]
         rows = self._get_candle_rows(

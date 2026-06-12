@@ -11,16 +11,19 @@ from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
+    MessageHandler,
+    filters,
 )
 
 from analytics import (
     TRADING_CONDITION_TEXT,
     build_manual_report,
     build_turnover_report,
-    collect_moex_analysis,
+    collect_market_analysis,
     format_candle_key_period,
+    strip_candle_key_source,
 )
-from config import SUPPORTED_TIMEFRAMES, Settings, load_settings
+from config import INTRADAY_TIMEFRAME_MINUTES, SUPPORTED_TIMEFRAMES, Settings, load_settings
 from instruments import get_available_tickers
 from keyboards import (
     CALLBACK_HELP,
@@ -72,14 +75,22 @@ TELEGRAM_POOL_TIMEOUT_SECONDS = 5
 TELEGRAM_CONCURRENT_UPDATES = 16
 TICKERS_PAGE_SIZE = 20
 TICKERS_MENU_PAGE_STATE_KEY = "tickers_menu_pages"
+MANUAL_REPORT_LOCKS_KEY = "manual_report_locks"
 EMPTY_SELECTED_TICKERS_TEXT = (
     "У вас не выбрано ни одного тикера. Откройте Мои тикеры и выберите акции для отслеживания."
 )
 
 AUTO_CANDLE_PHRASES = {
     "1m": "минутной",
+    "2m": "2-минутной",
+    "3m": "3-минутной",
+    "5m": "5-минутной",
     "10m": "10-минутной",
+    "15m": "15-минутной",
+    "30m": "30-минутной",
     "1h": "часовой",
+    "2h": "2-часовой",
+    "4h": "4-часовой",
     "1d": "дневной",
     "1w": "недельной",
     "1mo": "месячной",
@@ -103,9 +114,14 @@ class SecretRedactingFilter(logging.Filter):
         return True
 
 
-def setup_logging(log_file: Path, *, token: str) -> None:
+def setup_logging(
+    log_file: Path,
+    *,
+    token: str,
+    extra_secrets: list[str] | None = None,
+) -> None:
     log_file.parent.mkdir(parents=True, exist_ok=True)
-    redacting_filter = SecretRedactingFilter([token])
+    redacting_filter = SecretRedactingFilter([token, *(extra_secrets or [])])
     console_handler = logging.StreamHandler()
     file_handler = logging.FileHandler(log_file, encoding="utf-8")
     console_handler.addFilter(redacting_filter)
@@ -128,6 +144,15 @@ def get_user_settings_store(context: ContextTypes.DEFAULT_TYPE) -> UserSettingsS
     return context.application.bot_data["user_settings_store"]
 
 
+def get_manual_report_lock(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> asyncio.Lock:
+    locks = context.application.bot_data.setdefault(MANUAL_REPORT_LOCKS_KEY, {})
+    lock = locks.get(user_id)
+    if not isinstance(lock, asyncio.Lock):
+        lock = asyncio.Lock()
+        locks[user_id] = lock
+    return lock
+
+
 def get_all_tickers(context: ContextTypes.DEFAULT_TYPE, *, allow_missing: bool = True) -> list[str]:
     settings = get_settings(context)
     try:
@@ -135,6 +160,17 @@ def get_all_tickers(context: ContextTypes.DEFAULT_TYPE, *, allow_missing: bool =
     except FileNotFoundError:
         logger.exception("Tickers file was not found")
         return []
+
+
+def configured_data_source_label(settings: Settings) -> str:
+    token_present = bool(str(getattr(settings, "tinkoff_invest_token", "") or "").strip())
+    if getattr(settings, "use_tinvest_as_primary", True) and token_present:
+        if getattr(settings, "use_moex_fallback", True):
+            return "T-Invest API, fallback MOEX ISS API"
+        return "T-Invest API"
+    if getattr(settings, "use_moex_fallback", True):
+        return "MOEX ISS API"
+    return "T-Invest API недоступен"
 
 
 def is_user_allowed(update: Update, settings: Settings) -> bool:
@@ -223,6 +259,37 @@ async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     user_settings = ensure_user_settings(update, context)
     await send_manual_report(update, context, user_settings=user_settings)
+
+
+def normalize_reply_button_text(text: str) -> str:
+    value = " ".join(text.strip().split()).casefold()
+    for marker in ("🔄", "🔍", "⏱", "⬅️", "⬅", "️"):
+        value = value.replace(marker, "")
+    return " ".join(value.strip().split())
+
+
+async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    text = str(message.text or "") if message is not None else ""
+    user_id = update.effective_user.id if update.effective_user is not None else None
+    logger.info("Reply button received: user_id=%s text=%s", user_id, text)
+
+    settings = get_settings(context)
+    if not is_user_allowed(update, settings):
+        await deny_access(update)
+        return
+
+    user_settings = ensure_user_settings(update, context)
+    command = normalize_reply_button_text(text)
+
+    if command in {"обновить", "проверить сейчас"}:
+        await send_manual_report(update, context, user_settings=user_settings)
+    elif command == "таймфрейм":
+        await send_timeframe_menu(update, context)
+    elif command in {"главное меню", "меню"}:
+        await send_main_menu(update, context, user_settings)
+    else:
+        logger.info("Unknown text command: user_id=%s text=%s", user_id, text)
 
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -323,7 +390,7 @@ async def send_start_panel(
         f"Таймфреймы автоуведомлений: {timeframe_list_label(user_settings.notification_timeframes)}\n"
         f"Уведомления: {enabled_label(user_settings.auto_notifications_enabled)}\n"
         f"Количество тикеров: {tickers_count}\n"
-        "Источник данных: MOEX ISS API\n"
+        f"Источник данных: {configured_data_source_label(settings)}\n"
         f"Логика отбора: {TRADING_CONDITION_TEXT}"
     )
     await send_text(update, context, text, reply_markup=main_menu_keyboard())
@@ -463,7 +530,20 @@ async def set_notification_timeframe(
     user = update.effective_user
     if user is None:
         return
+    current_user_settings = store.get_user(user.id)
+    old_notification_timeframes = (
+        list(current_user_settings.notification_timeframes)
+        if current_user_settings is not None
+        else []
+    )
     user_settings = store.toggle_notification_timeframe(user.id, timeframe)
+    logger.info(
+        "Notification timeframe toggled: user_id=%s timeframe=%s old_notification_timeframes=%s new_notification_timeframes=%s",
+        user.id,
+        timeframe,
+        old_notification_timeframes,
+        user_settings.notification_timeframes,
+    )
     candle_phrase = AUTO_CANDLE_PHRASES.get(timeframe, timeframe_label(timeframe))
     if timeframe in BASE_NOTIFICATION_TIMEFRAMES:
         text = (
@@ -511,6 +591,34 @@ async def send_manual_report(
     *,
     user_settings: UserSettings,
 ) -> None:
+    lock = get_manual_report_lock(context, user_settings.user_id)
+    if lock.locked():
+        logger.info(
+            "Manual report skipped: user_id=%s reason=already_running",
+            user_settings.user_id,
+        )
+        await send_text(
+            update,
+            context,
+            "Проверка уже выполняется, подождите немного.",
+            reply_markup=report_actions_keyboard(),
+        )
+        return
+
+    async with lock:
+        await send_manual_report_unlocked(
+            update,
+            context,
+            user_settings=user_settings,
+        )
+
+
+async def send_manual_report_unlocked(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    user_settings: UserSettings,
+) -> None:
     settings = get_settings(context)
     store = get_user_settings_store(context)
     user_settings = store.ensure_selected_tickers(
@@ -540,7 +648,7 @@ async def send_manual_report(
 
     try:
         result = await asyncio.to_thread(
-            collect_moex_analysis,
+            collect_market_analysis,
             settings,
             user_settings.timeframe,
             selected_tickers,
@@ -597,7 +705,9 @@ def build_manual_stale_candle_warning(
     expected_candle_key: str,
     timezone_name: str,
 ) -> str | None:
-    latest_available_candle_key = result.latest_candle_key
+    latest_available_candle_key = getattr(result, "latest_raw_candle_key", None)
+    if latest_available_candle_key is None:
+        latest_available_candle_key = strip_candle_key_source(result.latest_candle_key)
     if latest_available_candle_key is None:
         return None
     if latest_available_candle_key >= expected_candle_key:
@@ -605,14 +715,10 @@ def build_manual_stale_candle_warning(
 
     suffix = (
         f" {timezone_label(timezone_name)}"
-        if result.timeframe in {"1m", "10m", "1h"}
+        if result.timeframe in INTRADAY_TIMEFRAME_MINUTES
         else ""
     )
-    title = (
-        "⚠️ MOEX ещё не отдала свежую часовую свечу."
-        if result.timeframe == "1h"
-        else "⚠️ MOEX ещё не отдала свежую свечу."
-    )
+    title = "⚠️ Источник данных ещё не отдал свежую свечу."
     return "\n".join(
         [
             title,
@@ -685,7 +791,7 @@ async def send_turnover_report(
 
     try:
         result = await asyncio.to_thread(
-            collect_moex_analysis,
+            collect_market_analysis,
             settings,
             user_settings.timeframe,
             selected_tickers,
@@ -956,7 +1062,7 @@ async def send_settings(
         f"Таймфрейм ручной проверки: {timeframe_label(user_settings.timeframe)}\n"
         f"Таймфреймы автоуведомлений: {timeframe_list_label(user_settings.notification_timeframes)}\n"
         f"Уведомления: {enabled_label(user_settings.auto_notifications_enabled)}\n"
-        "Источник данных: MOEX\n"
+        f"Источник данных: {configured_data_source_label(settings)}\n"
         f"Количество тикеров: {count_tickers(settings)}\n"
         f"Timezone: {settings.timezone_name}\n"
         f"chat_id: {user_settings.chat_id}\n"
@@ -972,24 +1078,25 @@ async def send_help(
 ) -> None:
     text = (
         "❓ Помощь\n\n"
-        "Бот отслеживает акции MOEX из tickers.txt через MOEX ISS API.\n\n"
-        "Таймфрейм — период одной свечи: 1 минута, 10 минут, 1 час, 1 день, "
-        "1 неделя или 1 месяц.\n\n"
+        "Бот отслеживает акции MOEX из tickers.txt через T-Invest API. "
+        "MOEX ISS API используется как резервный источник.\n\n"
+        "Таймфрейм — период одной свечи: 1m, 2m, 3m, 5m, 10m, 15m, 30m, "
+        "1h, 2h, 4h, 1d, 1w или 1mo.\n\n"
         "При проверке бот берёт две последние закрытые свечи выбранного таймфрейма "
         "и проверяет условие: close последней свечи > high предыдущей свечи. "
         "Простыми словами: акция закрылась выше максимума предыдущей свечи.\n\n"
-        "Текущая незакрытая свеча не используется. Для 1m и 10m бот берёт готовые "
-        "свечи MOEX ISS без ручной агрегации.\n\n"
+        "Текущая незакрытая свеча не используется. Для T-Invest бот берёт последнюю "
+        "закрытую свечу сразу; новые intraday-таймфреймы работают через T-Invest.\n\n"
         "Автоуведомления за 1 день, 1 неделю и 1 месяц включены в базовом наборе. "
-        "В разделе уведомлений можно дополнительно включить 1m, 10m или 1h; "
+        "В разделе уведомлений можно дополнительно включить любой поддерживаемый таймфрейм; "
         "например, 10m будет работать вместе с 1d, 1w и 1mo. Бот проверяет новую "
         "закрытую свечу примерно раз в минуту и не отправляет пустые автоотчёты, "
         "если подходящих тикеров нет.\n\n"
         "Статусы X2, X3, X4 и далее показываются только в автоуведомлениях. X2 означает, "
         "что тикер второй раз подряд попал в выборку на разных закрытых свечах выбранного таймфрейма. "
         "Если тикер перестал попадать, счётчик сбрасывается.\n\n"
-        "В отчётах не показывается volume. Если MOEX вернул поле value, бот "
-        "показывает оборот в рублях.\n\n"
+        "В отчётах не показывается volume. Оборот считается в рублях; для T-Invest "
+        "используется close * volume * lot.\n\n"
         "Кнопки:\n"
         "▶️ Старт — показать текущие настройки.\n"
         "🔄 Рестарт — сбросить настройки без удаления истории Telegram.\n"
@@ -1033,7 +1140,22 @@ async def post_shutdown(application: Application) -> None:
 
 def main() -> None:
     settings = load_settings()
-    setup_logging(settings.log_file, token=settings.telegram_bot_token)
+    setup_logging(
+        settings.log_file,
+        token=settings.telegram_bot_token,
+        extra_secrets=[settings.tinkoff_invest_token],
+    )
+    token_present = bool(settings.tinkoff_invest_token)
+    logger.info(
+        "Market data config: supported_timeframes=%s USE_TINVEST_AS_PRIMARY=%s "
+        "USE_MOEX_FALLBACK=%s T-Invest token present=%s",
+        ",".join(SUPPORTED_TIMEFRAMES),
+        str(settings.use_tinvest_as_primary).lower(),
+        str(settings.use_moex_fallback).lower(),
+        str(token_present).lower(),
+    )
+    if not token_present:
+        logger.warning("T-Invest token is missing. Using MOEX fallback.")
 
     user_settings_store = UserSettingsStore(
         settings.user_settings_path,
@@ -1061,6 +1183,7 @@ def main() -> None:
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("report", report_command))
     application.add_handler(CallbackQueryHandler(handle_callback))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
 
     logger.info("Bot is starting")
     application.run_polling(allowed_updates=Update.ALL_TYPES)

@@ -7,16 +7,19 @@ from pathlib import Path
 from threading import RLock
 from typing import Any
 
+from config import SUPPORTED_TIMEFRAMES
+
 
 logger = logging.getLogger(__name__)
 
-SUPPORTED_TIMEFRAMES = ("1m", "10m", "1h", "1d", "1w", "1mo")
 BASE_NOTIFICATION_TIMEFRAMES = ("1d", "1w", "1mo")
-OPTIONAL_NOTIFICATION_TIMEFRAMES = ("1m", "10m", "1h")
-TIMEFRAME_ALIASES = {
-    "5m": "1m",
-    "15m": "10m",
-}
+OPTIONAL_NOTIFICATION_TIMEFRAMES = tuple(
+    timeframe
+    for timeframe in SUPPORTED_TIMEFRAMES
+    if timeframe not in BASE_NOTIFICATION_TIMEFRAMES
+)
+TIMEFRAME_ALIASES: dict[str, str] = {}
+KNOWN_CANDLE_KEY_SOURCES = {"MOEX", "TINVEST"}
 
 
 @dataclass(frozen=True)
@@ -246,6 +249,12 @@ class UserSettingsStore:
     ) -> UserSettings:
         normalized_timeframe = normalize_supported_timeframe(timeframe)
         normalized_tickers = normalize_ticker_list(matched_tickers)
+        normalized_candle_key = normalize_candle_key_source(candle_key)
+        normalized_previous_candle_key = (
+            normalize_candle_key_source(previous_candle_key)
+            if previous_candle_key
+            else None
+        )
         with self._lock:
             raw = self._require_user(user_id)
             last_processed = raw.setdefault("last_processed_candle_keys", {})
@@ -255,7 +264,7 @@ class UserSettingsStore:
                 raw.setdefault("last_auto_report_tickers", {})
             )
             raw["last_auto_report_tickers"] = last_tickers
-            if last_processed_candle_key == candle_key:
+            if last_processed_candle_key == normalized_candle_key:
                 changed = False
                 previous_tickers = last_tickers.get(normalized_timeframe, [])
                 current_tickers = merge_ticker_lists(
@@ -279,8 +288,8 @@ class UserSettingsStore:
                     raw["streaks"] = normalized_streaks
                     changed = True
 
-                if sent and last_sent.get(normalized_timeframe) != candle_key:
-                    last_sent[normalized_timeframe] = candle_key
+                if sent and last_sent.get(normalized_timeframe) != normalized_candle_key:
+                    last_sent[normalized_timeframe] = normalized_candle_key
                     changed = True
 
                 if changed:
@@ -293,13 +302,13 @@ class UserSettingsStore:
                 current_streaks,
                 normalized_tickers,
                 last_processed_candle_key=last_processed_candle_key,
-                previous_candle_key=previous_candle_key,
+                previous_candle_key=normalized_previous_candle_key,
             )
             raw["streaks"] = normalize_streaks(streaks)
-            last_processed[normalized_timeframe] = candle_key
+            last_processed[normalized_timeframe] = normalized_candle_key
             last_tickers[normalized_timeframe] = normalized_tickers
             if sent:
-                last_sent[normalized_timeframe] = candle_key
+                last_sent[normalized_timeframe] = normalized_candle_key
             self._save()
             return self._to_user_settings(raw)
 
@@ -570,8 +579,27 @@ def normalize_last_sent_candle_keys(value: Any) -> dict[str, str]:
         normalized_timeframe = normalize_timeframe(str(timeframe))
         if normalized_timeframe not in SUPPORTED_TIMEFRAMES or not candle_time:
             continue
-        normalized[normalized_timeframe] = str(candle_time)
+        normalized[normalized_timeframe] = normalize_candle_key_source(candle_time)
     return normalized
+
+
+def normalize_candle_key_source(
+    candle_key: Any,
+    *,
+    default_source: str = "MOEX",
+) -> str:
+    value = str(candle_key).strip()
+    if not value:
+        return value
+
+    prefix, separator, rest = value.partition(":")
+    if separator and prefix.upper() in KNOWN_CANDLE_KEY_SOURCES and rest:
+        return f"{prefix.upper()}:{rest}"
+
+    source = default_source.upper()
+    if source not in KNOWN_CANDLE_KEY_SOURCES:
+        source = "MOEX"
+    return f"{source}:{value}"
 
 
 def normalize_ticker_list(value: Any) -> list[str]:
