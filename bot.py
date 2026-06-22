@@ -13,6 +13,7 @@ from telegram.ext import (
     ContextTypes,
 )
 
+from ai_analysis import build_market_context, fetch_daily_candles_for_ai
 from analytics import (
     TRADING_CONDITION_TEXT,
     build_manual_report,
@@ -20,9 +21,15 @@ from analytics import (
     collect_moex_analysis,
     format_candle_key_period,
 )
+from charting_ai import generate_ai_chart
 from config import SUPPORTED_TIMEFRAMES, Settings, load_settings
 from instruments import get_available_tickers
 from keyboards import (
+    CALLBACK_AI_ANALYSIS,
+    CALLBACK_AI_CHART_PREFIX,
+    CALLBACK_AI_REFRESH_PREFIX,
+    CALLBACK_AI_TICKER_PREFIX,
+    CALLBACK_AI_TICKERS_PAGE_PREFIX,
     CALLBACK_HELP,
     CALLBACK_LAST_REPORT,
     CALLBACK_NOTIFICATION_TIMEFRAME_MENU,
@@ -44,6 +51,8 @@ from keyboards import (
     REFRESH,
     TIMEFRAME_MENU,
     after_timeframe_keyboard,
+    ai_analysis_actions_keyboard,
+    build_ai_tickers_keyboard,
     build_tickers_keyboard,
     main_menu_keyboard,
     main_menu_only_keyboard,
@@ -53,10 +62,12 @@ from keyboards import (
     report_actions_keyboard,
     timeframe_keyboard,
 )
+from moex_client import MarketDataError
 from scheduler import get_expected_candle_key, start_scheduler, stop_scheduler
 from user_settings import BASE_NOTIFICATION_TIMEFRAMES, UserSettings, UserSettingsStore
 from utils import (
     enabled_label,
+    load_tickers,
     split_telegram_message,
     timeframe_list_label,
     timeframe_label,
@@ -71,6 +82,7 @@ TELEGRAM_GET_UPDATES_POOL_SIZE = 2
 TELEGRAM_POOL_TIMEOUT_SECONDS = 5
 TELEGRAM_CONCURRENT_UPDATES = 16
 TICKERS_PAGE_SIZE = 20
+AI_TICKERS_PAGE_SIZE = 24
 TICKERS_MENU_PAGE_STATE_KEY = "tickers_menu_pages"
 EMPTY_SELECTED_TICKERS_TEXT = (
     "У вас не выбрано ни одного тикера. Откройте Мои тикеры и выберите акции для отслеживания."
@@ -280,6 +292,33 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await send_last_report(update, context, user_settings=user_settings)
     elif data == CALLBACK_VOLUMES:
         await send_turnover_report(update, context, user_settings=user_settings)
+    elif data == CALLBACK_AI_ANALYSIS:
+        await send_ai_tickers_menu(update, context, page=0)
+    elif data.startswith(CALLBACK_AI_TICKERS_PAGE_PREFIX):
+        await send_ai_tickers_menu(
+            update,
+            context,
+            page=parse_ai_tickers_page(data),
+        )
+    elif data.startswith(CALLBACK_AI_TICKER_PREFIX):
+        await send_ai_analysis_for_ticker(
+            update,
+            context,
+            data.removeprefix(CALLBACK_AI_TICKER_PREFIX),
+        )
+    elif data.startswith(CALLBACK_AI_REFRESH_PREFIX):
+        await send_ai_analysis_for_ticker(
+            update,
+            context,
+            data.removeprefix(CALLBACK_AI_REFRESH_PREFIX),
+        )
+    elif data.startswith(CALLBACK_AI_CHART_PREFIX):
+        await send_ai_analysis_for_ticker(
+            update,
+            context,
+            data.removeprefix(CALLBACK_AI_CHART_PREFIX),
+            chart_only=True,
+        )
     elif data == CALLBACK_TICKERS:
         await send_tickers_menu(update, context, page=0)
     elif data.startswith(CALLBACK_TICKERS_PAGE_PREFIX):
@@ -716,6 +755,164 @@ async def send_turnover_report(
     await send_text(update, context, text, reply_markup=report_actions_keyboard())
 
 
+def get_ai_tickers(context: ContextTypes.DEFAULT_TYPE) -> list[str]:
+    settings = get_settings(context)
+    try:
+        return load_tickers(settings.tickers_file)
+    except FileNotFoundError:
+        logger.exception("Tickers file was not found for AI analysis")
+        return []
+
+
+async def send_ai_tickers_menu(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    page: int = 0,
+) -> None:
+    tickers = get_ai_tickers(context)
+    if not tickers:
+        await send_text(
+            update,
+            context,
+            "В tickers.txt нет тикеров для AI-анализа.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    total_pages = max(1, (len(tickers) + AI_TICKERS_PAGE_SIZE - 1) // AI_TICKERS_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    text = (
+        "🤖 Анализ AI\n\n"
+        "Выберите одну акцию из tickers.txt. "
+        "Анализ строится только по дневным свечам MOEX за последние 3 года.\n\n"
+        f"Страница {page + 1}/{total_pages}"
+    )
+    await edit_or_send_text(
+        update,
+        context,
+        text,
+        reply_markup=build_ai_tickers_keyboard(
+            tickers,
+            page=page,
+            page_size=AI_TICKERS_PAGE_SIZE,
+        ),
+    )
+
+
+async def send_ai_analysis_for_ticker(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    ticker: str,
+    *,
+    chart_only: bool = False,
+) -> None:
+    ticker = ticker.strip().upper()
+    tickers = get_ai_tickers(context)
+    if ticker not in tickers:
+        await send_text(
+            update,
+            context,
+            "Тикер не найден в tickers.txt. Выберите тикер из списка.",
+            reply_markup=build_ai_tickers_keyboard(tickers, page=0, page_size=AI_TICKERS_PAGE_SIZE)
+            if tickers
+            else main_menu_keyboard(),
+        )
+        return
+
+    settings = get_settings(context)
+    await send_text(update, context, "Собираю дневные данные за 3 года...")
+
+    candles = []
+    try:
+        candles = await asyncio.to_thread(
+            fetch_daily_candles_for_ai,
+            ticker,
+            3,
+            board=settings.moex_board,
+            timeout=settings.moex_timeout_seconds,
+            retries=settings.moex_request_retries,
+            timezone=settings.timezone,
+        )
+    except MarketDataError as exc:
+        logger.warning("AI analysis MOEX data error: ticker=%s error=%s", ticker, exc)
+    except Exception:
+        logger.exception("Failed to fetch candles for AI analysis: ticker=%s", ticker)
+        await send_text(
+            update,
+            context,
+            "Не удалось загрузить дневные свечи MOEX для AI-анализа. Подробности записаны в bot.log.",
+            reply_markup=ai_analysis_actions_keyboard(ticker),
+        )
+        return
+
+    await send_text(update, context, "Строю AI-анализ...")
+    analysis = await asyncio.to_thread(build_market_context, ticker, candles)
+
+    chart_path: Path | None = None
+    try:
+        chart_path = await asyncio.to_thread(generate_ai_chart, analysis)
+    except ImportError:
+        logger.exception("matplotlib is not installed")
+        await send_text(
+            update,
+            context,
+            "Не удалось построить график: не установлен matplotlib.",
+        )
+    except Exception:
+        logger.exception("Failed to generate AI chart: ticker=%s", ticker)
+        await send_text(
+            update,
+            context,
+            "Не удалось построить график AI-анализа. Подробности записаны в bot.log.",
+        )
+
+    await send_text(update, context, "Готово")
+
+    actions_markup = ai_analysis_actions_keyboard(ticker)
+    if chart_path is not None:
+        await send_ai_chart(
+            update,
+            context,
+            chart_path,
+            ticker,
+            reply_markup=actions_markup if chart_only else None,
+        )
+
+    if not chart_only:
+        await send_text(
+            update,
+            context,
+            analysis.analysis_text,
+            reply_markup=actions_markup,
+        )
+
+
+async def send_ai_chart(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    chart_path: Path,
+    ticker: str,
+    *,
+    reply_markup: InlineKeyboardMarkup | None = None,
+) -> None:
+    effective_chat = getattr(update, "effective_chat", None)
+    effective_message = getattr(update, "effective_message", None)
+    chat_id = effective_chat.id if effective_chat is not None else None
+    if chat_id is None and effective_message is not None:
+        chat_id = getattr(effective_message, "chat_id", None)
+    if chat_id is None:
+        return
+
+    with chart_path.open("rb") as photo:
+        await context.bot.send_photo(
+            chat_id=chat_id,
+            photo=photo,
+            caption=f"AI-анализ {ticker} | 1D",
+            reply_markup=reply_markup,
+        )
+
+
 async def send_tickers_menu(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -921,6 +1118,14 @@ def parse_tickers_page(callback_data: str) -> int:
         return 0
 
 
+def parse_ai_tickers_page(callback_data: str) -> int:
+    raw_page = callback_data.removeprefix(CALLBACK_AI_TICKERS_PAGE_PREFIX)
+    try:
+        return max(0, int(raw_page))
+    except ValueError:
+        return 0
+
+
 def get_tickers_menu_page(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> int:
     pages = context.application.bot_data.setdefault(TICKERS_MENU_PAGE_STATE_KEY, {})
     if not isinstance(pages, dict):
@@ -999,6 +1204,7 @@ async def send_help(
         "📄 Последний отчёт — показать последний сохранённый ручной отчёт.\n"
         "💰 Оборот — показать топ-10 тикеров по обороту последней свечи.\n"
         "📋 Мои тикеры — показать список из tickers.txt.\n"
+        "🤖 Анализ AI — среднесрочный разбор одной акции по дневным свечам за 3 года.\n"
         "⚙️ Настройки — показать параметры бота."
     )
     await send_text(update, context, text, reply_markup=main_menu_keyboard())

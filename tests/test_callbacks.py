@@ -9,6 +9,10 @@ from unittest.mock import AsyncMock, Mock, patch
 from bot import EMPTY_SELECTED_TICKERS_TEXT, handle_callback, send_manual_report
 from telegram.error import TelegramError
 from keyboards import (
+    CALLBACK_AI_ANALYSIS,
+    CALLBACK_AI_CHART_PREFIX,
+    CALLBACK_AI_REFRESH_PREFIX,
+    CALLBACK_AI_TICKER_PREFIX,
     CALLBACK_NOTIFICATIONS,
     CALLBACK_SETTINGS,
     CALLBACK_TICKERS,
@@ -16,6 +20,8 @@ from keyboards import (
     REFRESH,
     TIMEFRAME_MENU,
     after_timeframe_keyboard,
+    ai_analysis_actions_keyboard,
+    build_ai_tickers_keyboard,
     build_tickers_keyboard,
     main_menu_keyboard,
     main_menu_only_keyboard,
@@ -69,6 +75,7 @@ class KeyboardCallbackTests(unittest.TestCase):
         self.assertIn(TIMEFRAME_MENU, main_callbacks)
         self.assertIn(CALLBACK_NOTIFICATIONS, main_callbacks)
         self.assertIn(CALLBACK_TICKERS, main_callbacks)
+        self.assertIn(CALLBACK_AI_ANALYSIS, main_callbacks)
         self.assertIn(CALLBACK_SETTINGS, main_callbacks)
         self.assertEqual(report_callbacks, [REFRESH, TIMEFRAME_MENU, MAIN_MENU])
         self.assertIn(REFRESH, notification_callbacks)
@@ -81,6 +88,8 @@ class KeyboardCallbackTests(unittest.TestCase):
             after_timeframe_keyboard(),
             notifications_keyboard(),
             report_actions_keyboard(),
+            build_ai_tickers_keyboard(["SBER", "GAZP"]),
+            ai_analysis_actions_keyboard("SBER"),
             main_menu_only_keyboard(),
         ):
             self.assertTrue(all(callback_values(markup)))
@@ -111,6 +120,24 @@ class KeyboardCallbackTests(unittest.TestCase):
         self.assertIn("tickers_none", callbacks)
         self.assertIn("tickers_save", callbacks)
 
+    def test_ai_tickers_keyboard_and_actions(self) -> None:
+        markup = build_ai_tickers_keyboard(["SBER", "GAZP", "LKOH"], page=0)
+        callbacks = callback_values(markup)
+
+        self.assertIn(f"{CALLBACK_AI_TICKER_PREFIX}SBER", callbacks)
+        self.assertIn("ai:page:0", callbacks)
+        self.assertIn(MAIN_MENU, callbacks)
+
+        actions = callback_values(ai_analysis_actions_keyboard("SBER"))
+        self.assertEqual(
+            actions,
+            [
+                f"{CALLBACK_AI_REFRESH_PREFIX}SBER",
+                f"{CALLBACK_AI_CHART_PREFIX}SBER",
+                MAIN_MENU,
+            ],
+        )
+
 
 class CallbackHandlerTests(unittest.IsolatedAsyncioTestCase):
     async def test_main_menu_and_legacy_main_menu_are_answered_and_handled(self) -> None:
@@ -134,6 +161,7 @@ class CallbackHandlerTests(unittest.IsolatedAsyncioTestCase):
             (TIMEFRAME_MENU, "bot.send_timeframe_menu"),
             (CALLBACK_NOTIFICATIONS, "bot.send_notifications_menu"),
             (CALLBACK_TICKERS, "bot.send_tickers_menu"),
+            (CALLBACK_AI_ANALYSIS, "bot.send_ai_tickers_menu"),
             (CALLBACK_SETTINGS, "bot.send_settings"),
         )
 
@@ -149,6 +177,34 @@ class CallbackHandlerTests(unittest.IsolatedAsyncioTestCase):
 
                 query.answer.assert_awaited_once_with()
                 handler.assert_awaited_once()
+
+    async def test_ai_ticker_callbacks_are_routed(self) -> None:
+        routes = (
+            (f"{CALLBACK_AI_TICKER_PREFIX}SBER", False),
+            (f"{CALLBACK_AI_REFRESH_PREFIX}SBER", False),
+            (f"{CALLBACK_AI_CHART_PREFIX}SBER", True),
+        )
+
+        for data, chart_only in routes:
+            with self.subTest(data=data):
+                update, context, query = callback_update(data)
+
+                with (
+                    patch("bot.ensure_user_settings", return_value=object()),
+                    patch("bot.send_ai_analysis_for_ticker", new_callable=AsyncMock) as handler,
+                ):
+                    await handle_callback(update, context)
+
+                query.answer.assert_awaited_once_with()
+                if chart_only:
+                    handler.assert_awaited_once_with(
+                        update,
+                        context,
+                        "SBER",
+                        chart_only=True,
+                    )
+                else:
+                    handler.assert_awaited_once_with(update, context, "SBER")
 
     async def test_unknown_callback_answers_and_shows_main_menu_button(self) -> None:
         update, context, query = callback_update("unknown_callback")

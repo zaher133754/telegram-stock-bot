@@ -16,6 +16,11 @@ CALLBACK_NOTIFICATION_TIMEFRAME_MENU = "notify:timeframe_menu"
 CALLBACK_TOGGLE_NOTIFICATIONS = "notify:toggle"
 CALLBACK_LAST_REPORT = "menu:last_report"
 CALLBACK_VOLUMES = "menu:volumes"
+CALLBACK_AI_ANALYSIS = "ai:menu"
+CALLBACK_AI_TICKERS_PAGE_PREFIX = "ai:page:"
+CALLBACK_AI_TICKER_PREFIX = "ai:ticker:"
+CALLBACK_AI_REFRESH_PREFIX = "ai:refresh:"
+CALLBACK_AI_CHART_PREFIX = "ai:chart:"
 CALLBACK_TICKERS = "tickers_menu"
 CALLBACK_TICKERS_PAGE_PREFIX = "tickers_page:"
 CALLBACK_TICKER_TOGGLE_PREFIX = "ticker_toggle:"
@@ -61,6 +66,9 @@ def build_main_menu_keyboard() -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton("💰 Оборот", callback_data=CALLBACK_VOLUMES),
                 InlineKeyboardButton("📋 Мои тикеры", callback_data=CALLBACK_TICKERS),
+            ],
+            [
+                InlineKeyboardButton("🤖 Анализ AI", callback_data=CALLBACK_AI_ANALYSIS),
             ],
             [
                 InlineKeyboardButton("⚙️ Настройки", callback_data=CALLBACK_SETTINGS),
@@ -119,6 +127,68 @@ def build_tickers_keyboard(
         ]
     )
     return InlineKeyboardMarkup(rows)
+
+
+def build_ai_tickers_keyboard(
+    all_tickers: list[str] | tuple[str, ...],
+    page: int = 0,
+    page_size: int = 24,
+) -> InlineKeyboardMarkup:
+    page_size = max(1, page_size)
+    tickers = [str(ticker).strip().upper() for ticker in all_tickers if str(ticker).strip()]
+    total_pages = max(1, (len(tickers) + page_size - 1) // page_size)
+    page = max(0, min(page, total_pages - 1))
+    page_tickers = tickers[page * page_size : (page + 1) * page_size]
+
+    rows: list[list[InlineKeyboardButton]] = []
+    for index in range(0, len(page_tickers), 3):
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    ticker,
+                    callback_data=f"{CALLBACK_AI_TICKER_PREFIX}{ticker}",
+                )
+                for ticker in page_tickers[index : index + 3]
+            ]
+        )
+
+    previous_page = max(0, page - 1)
+    next_page = min(total_pages - 1, page + 1)
+    rows.append(
+        [
+            InlineKeyboardButton(
+                "⬅️ Назад",
+                callback_data=f"{CALLBACK_AI_TICKERS_PAGE_PREFIX}{previous_page}",
+            ),
+            InlineKeyboardButton(
+                "➡️ Далее",
+                callback_data=f"{CALLBACK_AI_TICKERS_PAGE_PREFIX}{next_page}",
+            ),
+        ]
+    )
+    rows.append([InlineKeyboardButton("Главное меню", callback_data=MAIN_MENU)])
+    return InlineKeyboardMarkup(rows)
+
+
+def ai_analysis_actions_keyboard(ticker: str) -> InlineKeyboardMarkup:
+    ticker = ticker.strip().upper()
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "🔄 Обновить анализ",
+                    callback_data=f"{CALLBACK_AI_REFRESH_PREFIX}{ticker}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "📈 Показать только график",
+                    callback_data=f"{CALLBACK_AI_CHART_PREFIX}{ticker}",
+                )
+            ],
+            [InlineKeyboardButton("⬅️ Главное меню", callback_data=MAIN_MENU)],
+        ]
+    )
 
 
 def timeframe_keyboard() -> InlineKeyboardMarkup:

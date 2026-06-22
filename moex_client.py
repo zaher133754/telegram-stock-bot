@@ -248,6 +248,21 @@ class MoexClient:
             previous_close=candles[-2].close,
         )
 
+    def get_daily_candles_history(self, ticker: str, *, years: int = 3) -> list[Candle]:
+        ticker = ticker.upper()
+        years = max(1, int(years))
+        rows = self._get_candle_rows(
+            ticker,
+            interval=DIRECT_TIMEFRAME_INTERVALS["1d"],
+            days_back=years * 366 + 14,
+            required_rows=years * 260 + 30,
+        )
+        candles = normalize_candle_data(ticker, rows, timezone=self.timezone)
+        current_time = datetime.now(self.timezone)
+        closed = self._closed_candles(candles, "1d", now=current_time)
+        cutoff = current_time.date() - timedelta(days=years * 366 + 7)
+        return [candle for candle in closed if candle.begin.date() >= cutoff]
+
     def _get_candle_rows(
         self,
         ticker: str,
