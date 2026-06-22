@@ -149,7 +149,7 @@ class ShouldCheckTimeframeTests(unittest.TestCase):
                 self.settings,
             )
         )
-        self.assertTrue(
+        self.assertFalse(
             should_check_timeframe(
                 "1mo",
                 moscow_datetime(2026, 7, 1, 23, 55, 10),
@@ -291,6 +291,62 @@ class SchedulerFilteringTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [call.kwargs["timeframe"] for call in check.await_args_list],
             ["1h", "10m", "1m"],
+        )
+
+    async def test_weekly_runs_after_daily_on_friday_close(self) -> None:
+        settings = schedule_settings()
+        user = SimpleNamespace(
+            auto_notifications_enabled=True,
+            notification_timeframes=["1d", "1w"],
+        )
+        store = SimpleNamespace(list_users=lambda: [user])
+        application = SimpleNamespace(
+            bot_data={
+                "settings": settings,
+                "user_settings_store": store,
+            }
+        )
+
+        with patch(
+            "scheduler.check_timeframe_notifications",
+            new_callable=AsyncMock,
+        ) as check:
+            await _run_auto_notifications(
+                application,
+                now=moscow_datetime(2026, 6, 5, 23, 55, 10),
+            )
+
+        self.assertEqual(
+            [call.kwargs["timeframe"] for call in check.await_args_list],
+            ["1d", "1w"],
+        )
+
+    async def test_monthly_runs_after_daily_on_last_month_day(self) -> None:
+        settings = schedule_settings()
+        user = SimpleNamespace(
+            auto_notifications_enabled=True,
+            notification_timeframes=["1d", "1mo"],
+        )
+        store = SimpleNamespace(list_users=lambda: [user])
+        application = SimpleNamespace(
+            bot_data={
+                "settings": settings,
+                "user_settings_store": store,
+            }
+        )
+
+        with patch(
+            "scheduler.check_timeframe_notifications",
+            new_callable=AsyncMock,
+        ) as check:
+            await _run_auto_notifications(
+                application,
+                now=moscow_datetime(2026, 6, 30, 23, 55, 10),
+            )
+
+        self.assertEqual(
+            [call.kwargs["timeframe"] for call in check.await_args_list],
+            ["1d", "1mo"],
         )
 
     async def test_one_minute_timeframe_is_throttled(self) -> None:

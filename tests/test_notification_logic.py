@@ -171,6 +171,16 @@ class ClosedCandleTests(unittest.TestCase):
         )
         self.assertEqual(
             self.client._closed_candles(
+                [weekly],
+                "1w",
+                now=moscow_datetime(2026, 6, 5, 23, 55),
+                weekly_close_day=4,
+                weekly_close_time=datetime(2000, 1, 1, 23, 55).time(),
+            ),
+            [weekly],
+        )
+        self.assertEqual(
+            self.client._closed_candles(
                 [monthly],
                 "1mo",
                 now=moscow_datetime(2026, 6, 30, 23, 59, 59),
@@ -182,6 +192,15 @@ class ClosedCandleTests(unittest.TestCase):
                 [monthly],
                 "1mo",
                 now=moscow_datetime(2026, 7, 1),
+            ),
+            [monthly],
+        )
+        self.assertEqual(
+            self.client._closed_candles(
+                [monthly],
+                "1mo",
+                now=moscow_datetime(2026, 6, 30, 23, 55),
+                monthly_close_time=datetime(2000, 1, 1, 23, 55).time(),
             ),
             [monthly],
         )

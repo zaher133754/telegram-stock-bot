@@ -127,6 +127,9 @@ def collect_moex_analysis(
             tickers=selected_tickers,
             timeframe=timeframe,
             timezone=settings.timezone,
+            weekly_close_day=settings.weekly_report_day,
+            weekly_close_time=settings.weekly_report_time,
+            monthly_close_time=settings.monthly_report_time,
         )
     finally:
         client.close()
@@ -138,6 +141,9 @@ def analyze_tickers(
     tickers: list[str],
     timeframe: str,
     timezone: tzinfo,
+    weekly_close_day: int | None = None,
+    weekly_close_time=None,
+    monthly_close_time=None,
 ) -> AnalysisResult:
     comparisons: list[CandleComparison] = []
     failures: list[tuple[str, str]] = []
@@ -154,7 +160,13 @@ def analyze_tickers(
                 if not debug_last_candles:
                     debug_last_candles = candles[-5:]
             else:
-                candles = client.get_last_two_closed_candles(ticker, timeframe)
+                candles = client.get_last_two_closed_candles(
+                    ticker,
+                    timeframe,
+                    weekly_close_day=weekly_close_day,
+                    weekly_close_time=weekly_close_time,
+                    monthly_close_time=monthly_close_time,
+                )
             comparison = compare_last_two_candles(candles)
         except MarketDataError as exc:
             logger.warning("Failed to get candle data for %s: %s", ticker, exc)

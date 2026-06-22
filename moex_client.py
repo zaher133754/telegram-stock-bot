@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta, tzinfo
+from datetime import date, datetime, time as datetime_time, timedelta, tzinfo
 from typing import Any, Iterable, Protocol
 from zoneinfo import ZoneInfo
 
@@ -47,10 +47,29 @@ class DailyCloseComparison:
 
 
 class MarketDataClient(Protocol):
-    def get_candles(self, ticker: str, timeframe: str, limit: int = 2) -> list[Candle]:
+    def get_candles(
+        self,
+        ticker: str,
+        timeframe: str,
+        limit: int = 2,
+        *,
+        now: datetime | None = None,
+        weekly_close_day: int | None = None,
+        weekly_close_time: datetime_time | None = None,
+        monthly_close_time: datetime_time | None = None,
+    ) -> list[Candle]:
         ...
 
-    def get_last_two_closed_candles(self, ticker: str, timeframe: str) -> list[Candle]:
+    def get_last_two_closed_candles(
+        self,
+        ticker: str,
+        timeframe: str,
+        *,
+        now: datetime | None = None,
+        weekly_close_day: int | None = None,
+        weekly_close_time: datetime_time | None = None,
+        monthly_close_time: datetime_time | None = None,
+    ) -> list[Candle]:
         ...
 
 
@@ -196,7 +215,17 @@ class MoexClient:
         self._owns_session = session is None
         self.request_count = 0
 
-    def get_candles(self, ticker: str, timeframe: str, limit: int = 2) -> list[Candle]:
+    def get_candles(
+        self,
+        ticker: str,
+        timeframe: str,
+        limit: int = 2,
+        *,
+        now: datetime | None = None,
+        weekly_close_day: int | None = None,
+        weekly_close_time: datetime_time | None = None,
+        monthly_close_time: datetime_time | None = None,
+    ) -> list[Candle]:
         ticker = ticker.upper()
         timeframe = _validate_timeframe(timeframe)
         if limit <= 0:
@@ -211,8 +240,15 @@ class MoexClient:
         )
         candles = normalize_candle_data(ticker, rows, timezone=self.timezone)
 
-        current_time = datetime.now(self.timezone)
-        closed = self._closed_candles(candles, timeframe, now=current_time)
+        current_time = _as_timezone(now or datetime.now(self.timezone), self.timezone)
+        closed = self._closed_candles(
+            candles,
+            timeframe,
+            now=current_time,
+            weekly_close_day=weekly_close_day,
+            weekly_close_time=weekly_close_time,
+            monthly_close_time=monthly_close_time,
+        )
         if timeframe == "1h":
             self._log_hourly_candle_debug(
                 ticker=ticker,
@@ -222,8 +258,25 @@ class MoexClient:
             )
         return closed[-limit:]
 
-    def get_last_two_closed_candles(self, ticker: str, timeframe: str) -> list[Candle]:
-        candles = self.get_candles(ticker, timeframe, limit=20)
+    def get_last_two_closed_candles(
+        self,
+        ticker: str,
+        timeframe: str,
+        *,
+        now: datetime | None = None,
+        weekly_close_day: int | None = None,
+        weekly_close_time: datetime_time | None = None,
+        monthly_close_time: datetime_time | None = None,
+    ) -> list[Candle]:
+        candles = self.get_candles(
+            ticker,
+            timeframe,
+            limit=20,
+            now=now,
+            weekly_close_day=weekly_close_day,
+            weekly_close_time=weekly_close_time,
+            monthly_close_time=monthly_close_time,
+        )
         if len(candles) < 2:
             raise MarketDataError(
                 f"{ticker.upper()}: less than two closed candles found for {timeframe}"
@@ -355,16 +408,54 @@ class MoexClient:
         timeframe: str,
         *,
         now: datetime | None = None,
+        weekly_close_day: int | None = None,
+        weekly_close_time: datetime_time | None = None,
+        monthly_close_time: datetime_time | None = None,
     ) -> list[Candle]:
         timeframe = _validate_timeframe(timeframe)
         current_time = _as_timezone(now or datetime.now(self.timezone), self.timezone)
         closed = [
             candle
             for candle in candles
-            if candle_close_time(candle, timeframe, timezone=self.timezone) <= current_time
+            if self._candle_close_time(
+                candle,
+                timeframe,
+                weekly_close_day=weekly_close_day,
+                weekly_close_time=weekly_close_time,
+                monthly_close_time=monthly_close_time,
+            )
+            <= current_time
         ]
         closed.sort(key=lambda candle: _candle_sort_key(candle, self.timezone))
         return closed
+
+    def _candle_close_time(
+        self,
+        candle: Candle,
+        timeframe: str,
+        *,
+        weekly_close_day: int | None = None,
+        weekly_close_time: datetime_time | None = None,
+        monthly_close_time: datetime_time | None = None,
+    ) -> datetime:
+        if (
+            timeframe == "1w"
+            and weekly_close_day is not None
+            and weekly_close_time is not None
+        ):
+            return weekly_configured_close_time(
+                candle,
+                weekly_close_day=weekly_close_day,
+                weekly_close_time=weekly_close_time,
+                timezone=self.timezone,
+            )
+        if timeframe == "1mo" and monthly_close_time is not None:
+            return monthly_configured_close_time(
+                candle,
+                monthly_close_time=monthly_close_time,
+                timezone=self.timezone,
+            )
+        return candle_close_time(candle, timeframe, timezone=self.timezone)
 
     def _log_hourly_candle_debug(
         self,
@@ -440,6 +531,39 @@ def candle_close_time(
     if begin.month == 12:
         return datetime(begin.year + 1, 1, 1, tzinfo=timezone)
     return datetime(begin.year, begin.month + 1, 1, tzinfo=timezone)
+
+
+def weekly_configured_close_time(
+    candle: Candle,
+    *,
+    weekly_close_day: int,
+    weekly_close_time: datetime_time,
+    timezone: tzinfo | None = None,
+) -> datetime:
+    timezone = timezone or ZoneInfo("Europe/Moscow")
+    begin = _as_timezone(candle.begin, timezone)
+    week_start = begin.date() - timedelta(days=begin.weekday())
+    close_day = week_start + timedelta(days=max(0, min(6, int(weekly_close_day))))
+    return datetime.combine(close_day, weekly_close_time, tzinfo=timezone)
+
+
+def monthly_configured_close_time(
+    candle: Candle,
+    *,
+    monthly_close_time: datetime_time,
+    timezone: tzinfo | None = None,
+) -> datetime:
+    timezone = timezone or ZoneInfo("Europe/Moscow")
+    begin = _as_timezone(candle.begin, timezone)
+    last_day = calendar_month_last_day(begin.date())
+    return datetime.combine(last_day, monthly_close_time, tzinfo=timezone)
+
+
+def calendar_month_last_day(value: date) -> date:
+    if value.month == 12:
+        return date(value.year, 12, 31)
+    first_next_month = date(value.year, value.month + 1, 1)
+    return first_next_month - timedelta(days=1)
 
 
 def candle_key(

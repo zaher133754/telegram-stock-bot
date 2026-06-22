@@ -680,7 +680,7 @@ def _is_in_scheduled_time_window(
 
 def _is_month_end_check_day(now: datetime) -> bool:
     last_day = calendar.monthrange(now.year, now.month)[1]
-    return now.day >= last_day - 3 or now.day <= 3
+    return now.day == last_day
 
 
 def _previous_trading_day(value: date) -> date:
