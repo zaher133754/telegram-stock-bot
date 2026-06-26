@@ -87,7 +87,7 @@ class MoexPaginationTests(unittest.TestCase):
 
 
 class CurrentQuoteTests(unittest.TestCase):
-    def test_current_quote_uses_marketdata_last(self) -> None:
+    def test_current_quote_prefers_lcurrentprice_over_last(self) -> None:
         client = MoexClient(timezone=MOSCOW, session=Mock())
         client._get_json = Mock(
             return_value={
@@ -110,10 +110,29 @@ class CurrentQuoteTests(unittest.TestCase):
 
         quote = client.get_current_quote("SBER")
 
-        self.assertEqual(quote.current_price, 291.22)
+        self.assertEqual(quote.current_price, 291.28)
         self.assertEqual(quote.previous_close, 295.16)
         self.assertEqual(quote.trade_date, date(2026, 6, 26))
         self.assertEqual(quote.updated_at, datetime(2026, 6, 26, 12, 23, 34, tzinfo=MOSCOW))
+
+    def test_current_quote_falls_back_to_last(self) -> None:
+        client = MoexClient(timezone=MOSCOW, session=Mock())
+        client._get_json = Mock(
+            return_value={
+                "marketdata": {
+                    "columns": ["SECID", "LAST", "LCURRENTPRICE", "SYSTIME"],
+                    "data": [["SBER", 291.22, None, "2026-06-26 12:23:34"]],
+                },
+                "securities": {
+                    "columns": ["SECID", "PREVPRICE"],
+                    "data": [["SBER", 295.16]],
+                },
+            }
+        )
+
+        quote = client.get_current_quote("SBER")
+
+        self.assertEqual(quote.current_price, 291.22)
 
     def test_current_quote_falls_back_to_lcurrentprice(self) -> None:
         client = MoexClient(timezone=MOSCOW, session=Mock())

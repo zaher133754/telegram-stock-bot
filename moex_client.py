@@ -305,8 +305,8 @@ class MoexClient:
         current_price = _first_positive_float(
             market_row,
             (
-                "LAST",
                 "LCURRENTPRICE",
+                "LAST",
                 "MARKETPRICE2",
                 "MARKETPRICE",
                 "WAPRICE",
