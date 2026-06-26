@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import unittest
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from unittest.mock import Mock
 from zoneinfo import ZoneInfo
 
@@ -84,6 +84,56 @@ class MoexPaginationTests(unittest.TestCase):
             for call in client._get_json.call_args_list
         ]
         self.assertEqual(starts, [0, 1500])
+
+
+class CurrentQuoteTests(unittest.TestCase):
+    def test_current_quote_uses_marketdata_last(self) -> None:
+        client = MoexClient(timezone=MOSCOW, session=Mock())
+        client._get_json = Mock(
+            return_value={
+                "marketdata": {
+                    "columns": [
+                        "SECID",
+                        "LAST",
+                        "LCURRENTPRICE",
+                        "MARKETPRICE",
+                        "SYSTIME",
+                    ],
+                    "data": [["SBER", 291.22, 291.28, 298.94, "2026-06-26 12:23:34"]],
+                },
+                "securities": {
+                    "columns": ["SECID", "PREVPRICE"],
+                    "data": [["SBER", 295.16]],
+                },
+            }
+        )
+
+        quote = client.get_current_quote("SBER")
+
+        self.assertEqual(quote.current_price, 291.22)
+        self.assertEqual(quote.previous_close, 295.16)
+        self.assertEqual(quote.trade_date, date(2026, 6, 26))
+        self.assertEqual(quote.updated_at, datetime(2026, 6, 26, 12, 23, 34, tzinfo=MOSCOW))
+
+    def test_current_quote_falls_back_to_lcurrentprice(self) -> None:
+        client = MoexClient(timezone=MOSCOW, session=Mock())
+        client._get_json = Mock(
+            return_value={
+                "marketdata": {
+                    "columns": ["SECID", "LAST", "LCURRENTPRICE", "SYSTIME"],
+                    "data": [["GAZP", None, 96.01, "2026-06-26 12:23:49"]],
+                },
+                "securities": {
+                    "columns": ["SECID", "PREVPRICE"],
+                    "data": [["GAZP", 98.07]],
+                },
+            }
+        )
+
+        quote = client.get_current_quote("GAZP")
+
+        self.assertEqual(quote.current_price, 96.01)
+        self.assertEqual(quote.previous_close, 98.07)
 
 
 class HourlyDebugTests(unittest.TestCase):

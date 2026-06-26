@@ -13,7 +13,7 @@ from telegram.ext import (
     ContextTypes,
 )
 
-from ai_analysis import build_market_context, fetch_daily_candles_for_ai
+from ai_analysis import AIMarketData, build_market_context, fetch_market_data_for_ai
 from analytics import (
     TRADING_CONDITION_TEXT,
     build_manual_report,
@@ -823,10 +823,10 @@ async def send_ai_analysis_for_ticker(
     settings = get_settings(context)
     await send_text(update, context, "Собираю дневные данные за 3 года...")
 
-    candles = []
+    market_data = AIMarketData(candles=[])
     try:
-        candles = await asyncio.to_thread(
-            fetch_daily_candles_for_ai,
+        market_data = await asyncio.to_thread(
+            fetch_market_data_for_ai,
             ticker,
             3,
             board=settings.moex_board,
@@ -847,7 +847,13 @@ async def send_ai_analysis_for_ticker(
         return
 
     await send_text(update, context, "Строю AI-анализ...")
-    analysis = await asyncio.to_thread(build_market_context, ticker, candles)
+    analysis = await asyncio.to_thread(
+        build_market_context,
+        ticker,
+        market_data.candles,
+        current_price=market_data.current_price,
+        current_price_date=market_data.current_price_date,
+    )
 
     chart_path: Path | None = None
     try:

@@ -34,7 +34,9 @@ class Candle:
 class CurrentQuote:
     ticker: str
     current_price: float
-    previous_close: float
+    previous_close: float | None = None
+    trade_date: date | None = None
+    updated_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -284,11 +286,57 @@ class MoexClient:
         return candles[-2:]
 
     def get_current_quote(self, ticker: str) -> CurrentQuote:
-        candles = self.get_last_two_closed_candles(ticker, "1d")
+        ticker = ticker.upper()
+        payload = self._get_json(
+            f"/engines/stock/markets/shares/boards/{self.board}/securities/{ticker}.json",
+            params={
+                "iss.meta": "off",
+                "iss.only": "securities,marketdata",
+                "securities.columns": "SECID,PREVPRICE",
+                "marketdata.columns": (
+                    "SECID,LAST,LCURRENTPRICE,MARKETPRICE2,MARKETPRICE,WAPRICE,"
+                    "CLOSEPRICE,PREVPRICE,LCLOSEPRICE,TRADEDATE,SYSTIME,TIME,UPDATETIME"
+                ),
+            },
+        )
+        market_row = _first_row_for_ticker(self._table_rows(payload, "marketdata"), ticker)
+        security_row = _first_row_for_ticker(self._table_rows(payload, "securities"), ticker)
+
+        current_price = _first_positive_float(
+            market_row,
+            (
+                "LAST",
+                "LCURRENTPRICE",
+                "MARKETPRICE2",
+                "MARKETPRICE",
+                "WAPRICE",
+                "CLOSEPRICE",
+            ),
+        )
+        previous_close = (
+            _first_positive_float(market_row, ("PREVPRICE", "LCLOSEPRICE"))
+            or _first_positive_float(security_row, ("PREVPRICE",))
+        )
+        updated_at = _parse_quote_datetime(market_row, self.timezone)
+        trade_date = _parse_moex_date(_pick(market_row or {}, "TRADEDATE"))
+        if trade_date is None and updated_at is not None:
+            trade_date = updated_at.date()
+
+        if current_price is None:
+            candles = self.get_last_two_closed_candles(ticker, "1d")
+            return CurrentQuote(
+                ticker=ticker,
+                current_price=candles[-1].close,
+                previous_close=candles[-2].close,
+                trade_date=candles[-1].end.date(),
+            )
+
         return CurrentQuote(
-            ticker=ticker.upper(),
-            current_price=candles[-1].close,
-            previous_close=candles[-2].close,
+            ticker=ticker,
+            current_price=current_price,
+            previous_close=previous_close,
+            trade_date=trade_date,
+            updated_at=updated_at,
         )
 
     def get_daily_close_comparison(self, ticker: str) -> DailyCloseComparison:
@@ -643,6 +691,63 @@ def _candle_sort_key(candle: Candle, timezone: tzinfo) -> tuple[datetime, dateti
 
 def _format_debug_datetime(value: datetime) -> str:
     return value.isoformat(sep=" ", timespec="seconds")
+
+
+def _first_row_for_ticker(
+    rows: list[dict[str, Any]],
+    ticker: str,
+) -> dict[str, Any] | None:
+    ticker = ticker.upper()
+    for raw_row in rows:
+        row = {str(key).upper(): value for key, value in raw_row.items()}
+        if str(row.get("SECID", "")).upper() == ticker:
+            return row
+    return rows[0] if rows else None
+
+
+def _first_positive_float(
+    row: dict[str, Any] | None,
+    fields: Iterable[str],
+) -> float | None:
+    if row is None:
+        return None
+    for field in fields:
+        value = _to_float(_pick(row, field))
+        if value is not None and value > 0:
+            return value
+    return None
+
+
+def _parse_moex_date(value: Any) -> date | None:
+    if value in (None, ""):
+        return None
+    try:
+        return date.fromisoformat(str(value).strip()[:10])
+    except ValueError:
+        return None
+
+
+def _parse_quote_datetime(
+    row: dict[str, Any] | None,
+    timezone: tzinfo,
+) -> datetime | None:
+    if row is None:
+        return None
+
+    systime = _parse_moex_datetime(_pick(row, "SYSTIME"), timezone)
+    if systime is not None:
+        return systime
+
+    trade_date = _parse_moex_date(_pick(row, "TRADEDATE"))
+    time_value = _pick(row, "UPDATETIME") or _pick(row, "TIME")
+    if trade_date is None or time_value in (None, ""):
+        return None
+
+    try:
+        parsed_time = datetime_time.fromisoformat(str(time_value).strip())
+    except ValueError:
+        return None
+    return datetime.combine(trade_date, parsed_time, tzinfo=timezone)
 
 
 def _pick(row: dict[str, Any], field: str) -> Any:

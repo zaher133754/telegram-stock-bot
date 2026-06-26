@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, replace
 from datetime import date, datetime, tzinfo
 from statistics import mean
 
-from moex_client import Candle, MoexClient
+from moex_client import Candle, MarketDataError, MoexClient
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -59,6 +63,13 @@ class AIAnalysisResult:
     analysis_text: str = ""
 
 
+@dataclass(frozen=True)
+class AIMarketData:
+    candles: list[Candle]
+    current_price: float | None = None
+    current_price_date: date | None = None
+
+
 def fetch_daily_candles_for_ai(
     ticker: str,
     years: int = 3,
@@ -80,7 +91,52 @@ def fetch_daily_candles_for_ai(
         client.close()
 
 
-def build_market_context(ticker: str, candles: list[Candle]) -> AIAnalysisResult:
+def fetch_market_data_for_ai(
+    ticker: str,
+    years: int = 3,
+    *,
+    board: str = "TQBR",
+    timeout: float = 20,
+    retries: int = 3,
+    timezone: tzinfo | None = None,
+) -> AIMarketData:
+    client = MoexClient(
+        board=board,
+        timeout=timeout,
+        retries=retries,
+        timezone=timezone,
+    )
+    try:
+        candles = client.get_daily_candles_history(ticker, years=years)
+        try:
+            quote = client.get_current_quote(ticker)
+        except MarketDataError as exc:
+            logger.warning(
+                "AI analysis live quote is unavailable: ticker=%s error=%s",
+                ticker,
+                exc,
+            )
+            return AIMarketData(candles=candles)
+
+        quote_date = quote.trade_date
+        if quote_date is None and quote.updated_at is not None:
+            quote_date = quote.updated_at.date()
+        return AIMarketData(
+            candles=candles,
+            current_price=quote.current_price,
+            current_price_date=quote_date,
+        )
+    finally:
+        client.close()
+
+
+def build_market_context(
+    ticker: str,
+    candles: list[Candle],
+    *,
+    current_price: float | None = None,
+    current_price_date: date | None = None,
+) -> AIAnalysisResult:
     ticker = ticker.strip().upper()
     candles = sorted(candles, key=lambda candle: (candle.begin, candle.end))
 
@@ -120,7 +176,14 @@ def build_market_context(ticker: str, candles: list[Candle]) -> AIAnalysisResult
         return replace(result, analysis_text=render_ai_analysis_text(result))
 
     closes = [candle.close for candle in candles]
-    current_price = closes[-1]
+    last_close = closes[-1]
+    current_price = current_price if _is_positive_price(current_price) else last_close
+    change_closes = _closes_with_current_price(
+        closes,
+        current_price=current_price,
+        current_price_date=current_price_date,
+        last_candle_date=candles[-1].begin.date(),
+    )
     sma20 = _sma(closes, 20)
     sma50 = _sma(closes, 50)
     sma200 = _sma(closes, 200)
@@ -140,6 +203,7 @@ def build_market_context(ticker: str, candles: list[Candle]) -> AIAnalysisResult
         sma20=sma20,
         sma50=sma50,
         sma200=sma200,
+        current_price=current_price,
     )
     strong_support_near = _has_near_level(
         support_levels,
@@ -165,11 +229,11 @@ def build_market_context(ticker: str, candles: list[Candle]) -> AIAnalysisResult
 
     result = AIAnalysisResult(
         ticker=ticker,
-        as_of=candles[-1].begin.date(),
+        as_of=current_price_date or candles[-1].begin.date(),
         candles=candles,
         current_price=current_price,
-        weekly_change_pct=_period_change(closes, 5),
-        monthly_change_pct=_period_change(closes, 21),
+        weekly_change_pct=_period_change(change_closes, 5),
+        monthly_change_pct=_period_change(change_closes, 21),
         trend_state=trend_state,
         support_levels=support_levels,
         resistance_levels=resistance_levels,
@@ -261,12 +325,13 @@ def detect_trend_state(
     sma20: float | None = None,
     sma50: float | None = None,
     sma200: float | None = None,
+    current_price: float | None = None,
 ) -> str:
     if len(candles) < 50:
         return "range"
 
     closes = [candle.close for candle in candles]
-    current_price = closes[-1]
+    current_price = current_price if _is_positive_price(current_price) else closes[-1]
     sma50_past = _sma(closes[:-20], 50) if len(closes) >= 70 else None
     sma50_slope_pct = _pct_change(sma50, sma50_past) if sma50 and sma50_past else 0.0
 
@@ -609,6 +674,24 @@ def _sma(values: list[float], period: int) -> float | None:
     if len(values) < period:
         return None
     return mean(values[-period:])
+
+
+def _is_positive_price(value: float | None) -> bool:
+    return value is not None and value > 0
+
+
+def _closes_with_current_price(
+    closes: list[float],
+    *,
+    current_price: float,
+    current_price_date: date | None,
+    last_candle_date: date,
+) -> list[float]:
+    if not closes or current_price == closes[-1]:
+        return closes
+    if current_price_date is not None and current_price_date > last_candle_date:
+        return [*closes, current_price]
+    return [*closes[:-1], current_price]
 
 
 def _period_change(values: list[float], sessions: int) -> float | None:

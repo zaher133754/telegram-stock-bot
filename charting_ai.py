@@ -92,6 +92,8 @@ def generate_ai_chart(
         _draw_level(ax, analysis.support_levels[0].price, "Support", "#2e7d32", "--")
     if analysis.resistance_levels:
         _draw_level(ax, analysis.resistance_levels[0].price, "Resistance", "#c62828", "--")
+    if analysis.current_price is not None:
+        _draw_level(ax, analysis.current_price, "Current", "#ef6c00", ":")
     if not analysis.no_trade_setup:
         _draw_level(ax, analysis.entry_price, "Entry", "#0277bd", "-")
         _draw_level(ax, analysis.stop_price, "Stop", "#b71c1c", "-")

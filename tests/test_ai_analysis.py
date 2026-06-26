@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import unittest
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -53,6 +53,18 @@ class AIAnalysisTests(unittest.TestCase):
         self.assertIsNone(result.entry_price)
         self.assertIn("AI-анализ: SBER", result.analysis_text)
         self.assertIn("Точка входа", result.analysis_text)
+
+    def test_live_price_overrides_last_daily_close(self) -> None:
+        result = build_market_context(
+            "GAZP",
+            make_candles([100, 99, 98.07]),
+            current_price=96.4,
+            current_price_date=date(2026, 6, 26),
+        )
+
+        self.assertEqual(result.current_price, 96.4)
+        self.assertEqual(result.as_of, date(2026, 6, 26))
+        self.assertIn("96.4", result.analysis_text)
 
     def test_downtrend_is_observation_from_side(self) -> None:
         prices = [200 - index * 0.25 for index in range(260)]
